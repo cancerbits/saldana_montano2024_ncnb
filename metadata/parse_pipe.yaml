@@ -1,0 +1,6 @@
+parse_pipe_dir: /home/${USER}/bioinf_isilon/Research/HALBRITTER/Internal/users/florian/parse_pipe/
+sample_sheet: samples_parse.csv
+run_id: NCNB_SCRNASEQ_2023_L5909__BSF_1449_HHGW5DSX7
+sublib_ids: Parse_Sublib2 Parse_Sublib3 Parse_Sublib4 Parse_Sublib5 Parse_Sublib6 Parse_Sublib7 Parse_Sublib8 Parse_Sublib9 Parse_Sublib10 Parse_Sublib11 Parse_Sublib12 Parse_Sublib13 Parse_Sublib14 Parse_Sublib15 Parse_Sublib16
+samtools: /home/${USER}/bioinf_isilon/Research/HALBRITTER/Internal/tools/samtools-1.17/bin/samtools
+max_threads: 96

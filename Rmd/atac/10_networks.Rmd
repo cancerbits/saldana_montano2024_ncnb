@@ -1,0 +1,782 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: GRNs and target scores' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we combine information about (a) genes that are proximal to
+ATAC-seq peaks [= potential downstream targets], (b) TF motif matches in the 
+peaks [= potential upstream regulators], and (c) correlation of gene expression
+profiles [in our scRNA-seq data], to infer gene-regulatory networks and predict
+transcription factors and their targets.
+
+These plots feed into Fig. 10 and Supplementary Fig. 13 of the paper.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+```
+
+Load required input data from previous steps:
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS_ANNOTATED)
+geneAssignments <- latestCache(CACHE_ATAC_GENE_ASSIGNMENTS)
+enrichRes <- latestCache(CACHE_ATAC_ENRICHMENT_RESULTS)
+enrichmentDatabases <- latestCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "motifs"))
+scDataF <- latestCache(CACHE_SCRNA_DATA)
+scDataUMAP <- latestCache(CACHE_SCRNA_UMAP)
+mutGenes <- latestCache(CACHE_SCRNA_MUT_GENES)
+metaMutScore <- latestCache(CACHE_SCRNA_MUT_SCORE)
+metaMutScore[, cell_id := gsub("-1$", "", gsub("_GEX", "", cell_id))]
+metaMutScore[, condition := gsub("^c", "", ccondition)]
+setkey(metaMutScore, cell_id)
+```
+  
+Functions/constants specifically used in this notebook.
+
+```{r def_networks_funcs}
+MIN_PEARSON <- 0.1
+ENRICH_MIN_PERC <- 0.05
+ENRICH_P <- 0.05
+ENRICH_ODDS <- log2(4)
+ENRICH_PADJ_MOTIFS <- 0.0000001
+ENRICH_ODDS_MOTIFS <- log2(2)
+
+COLOR_PALETTES$reg_dir <- c(
+	inhibitory="blue", 
+	activating="red", 
+	marginal="grey"
+)
+
+SAMPLE_BY_CLUSTERS <- "seurat_clusters"
+```
+
+
+
+# Assemble data from other analysis steps
+
+All annotated ATAC-seq peaks (with DAR results and modules):
+
+```{r check_peaks}
+print(head(peaksDt))
+```
+
+Preliminary peak-to-gene assignments (see `04_annotate_genes.Rmd`):
+
+```{r check_gene_assgn}
+asgn <- geneAssignments$promo_or_sig
+rm(geneAssignments)
+
+print(head(asgn))
+```
+
+Motif-to-peak assignments (see `05_annotate_motifs.Rmd`) for all motifs that were found enriched in >=1 comparison (see `08_enrichments.Rmd`):
+
+```{r check_mootifs}
+sigMotifs <- enrichRes[database=="motifs" & is.finite(log2odds) & is.finite(padj) & padj<=ENRICH_PADJ_MOTIFS & abs(log2odds)>=ENRICH_ODDS_MOTIFS, simpleMotifName(unique(label))] # sig==T
+mtfMatches <- enrichmentDatabases$motifs$lists
+names(mtfMatches) <- simpleMotifName(names(mtfMatches))
+allTFs <- names(mtfMatches) 
+
+mtfMatches <- as.data.table(reshape2::melt(mtfMatches, value.name="rid"))
+
+rm(enrichmentDatabases, enrichRes)
+
+print(head(mtfMatches))
+```
+
+# Define base network
+
+Define base network as all edges between motif-peak-gene triples:
+- `asgn` at this point contains putative downstream targets of peaks
+- `mtfMatches` contains TFs with a motif match in each peak, i.e., putative upstream regulators
+
+```{r make_base_net}
+net <- unique(merge(asgn, mtfMatches, by="rid", allow.cartesian=T))[, .(rid, from=L1, to=gene_symbol)]
+net <- merge(net, peaksDt[, .(rid, module_id, all_mods_id)], by="rid")
+net[, id:=paste0(from,"--",to)]
+net[from=="MYCN",]
+
+
+allGenes <- sort(unique(c(net$to, net$from)))
+
+print(head(net))
+print(length(allGenes))
+```
+
+# Load single-cell data
+
+Single-cell RNA-seq data (for calculating gene-gene correlations):
+
+```{r load_scrna}
+scDataF$meta <- as.data.table(scDataF$meta, keep.rownames="cell_id")
+
+#allGenes <- intersect(allGenes, intersect(rownames(scDataF$d), rownames(dQuant)))
+allGenes <- intersect(allGenes, rownames(scDataF$d))
+
+tmp <- scDataF$d
+scDataF$d <- scDataF$d[allGenes,]
+scDataVer <- digest::digest(scDataF)
+scDataF$d <- tmp
+scDataF$umap <- scDataUMAP
+colnames(scDataF$umap) <- c("UMAP_1", "UMAP_2")
+rm(scDataUMAP)
+
+print(head(scDataF$meta))
+```
+
+
+```{r filt_net}
+net <- net[from%in%allGenes & to%in%allGenes,]
+gc()
+```
+
+
+
+# TF-to-target gene predictions
+
+Prepare randomly down-sampled versions of the single-cell data (stratified by `SAMPLE_BY_CLUSTERS`; this is meant to balance between over-represented hESCs at D0 and other stages):
+
+```{r def_indata}
+inDataSelections <- list()
+for(i in 1:10) {
+	set.seed(i)
+	inDataSelections[[paste_("sampled", SAMPLE_BY_CLUSTERS, i)]] <- scDataF$meta[sample(.N),][,head(.SD,500),by=SAMPLE_BY_CLUSTERS][,cell_id]			
+}
+```
+
+Start up Python environment and a local computing cluster for GRNBoost2:
+
+```{r start_py}
+library(reticulate)
+use_condaenv("/opt/conda/envs/arboreto")
+
+arbo <- reticulate::import("arboreto.algo")
+distrib <- reticulate::import("distributed")
+
+locCluster <- distrib$LocalCluster(n_workers=as.integer(config$n_threads_max), threads_per_worker=as.integer(1), scheduler_port=as.integer(3349), dashboard_address = reticulate::py_none())
+locClient <- distrib$Client(locCluster)
+```
+Execute GRNBoost2:
+
+```{r run_grnboost, error=FALSE}
+for(n in names(inDataSelections)) {
+
+	arboRes <- versionedCache(paste_("net_arbo", n), instruction={
+		sc_data <- as.matrix(sc_data)
+		
+		msg("load data ", n)
+
+		pyData <- reticulate::r_to_py(t(sc_data))
+		pyGnames <- reticulate::r_to_py(rownames(sc_data))
+		pyTFs <- reticulate::r_to_py(all_tfs)
+		
+		msg("start grnboost2 ", n)
+
+		arboRes <- arbo$grnboost2(expression_data = pyData, gene_names = pyGnames, tf_names = pyTFs, client_or_address = locClient)
+				
+		msg("done grnboost2 ", n)
+
+		return(arboRes)
+	}, noload=TRUE, buildEnvir=list(
+	  all_tfs=allTFs,
+	  sc_data=scDataF$d[allGenes, inDataSelections[[n]]]
+	))
+	
+}
+```
+Shut down the local computing cluster:
+
+```{r stop_py_serv}
+locClient$close()
+locCluster$close()
+```
+
+Calculate correlation coefficients on the same datasets (we use the correlation coefficients to determine the direction of TF-to-target interactions predicted by GRNboost2):
+
+```{r calc_wgcna}
+tfTargetCors <- versionedCache(paste_("tf_target_cor", n), instruction={
+	tfTargetCors <- rblapply(names(in_data_selections), function(n) {
+		msg(n)
+		scData <- as.matrix(sc_data[, in_data_selections[[n]]])
+		
+		tfTargetCors <- WGCNA::cor(t(scData[rownames(scData)%in%all_tfs,]),t(scData), nThreads=config$n_threads_max)
+		tfTargetCors <- as.data.table(reshape2::melt(tfTargetCors))
+		setnames(tfTargetCors, c("from","to","pearson"))
+	}, "sampling_name")
+	
+	tfTargetCors <- tfTargetCors[, .(pearson=mean(pearson, na.rm=T), min_p=min(pearson, na.rm=T), max_p=max(pearson, na.rm=T)), by=.(from,to)]
+	
+	return(tfTargetCors)
+}, buildEnvir=list(
+	  all_tfs=allTFs,
+	  in_data_selections=inDataSelections,
+	  sc_data=scDataF$d[allGenes, ]
+))
+
+print(head(tfTargetCors))
+```
+
+Merge sampled GRNBoost2 runs:
+
+```{r merge_grnboost}
+arboRes <- versionedCache(paste_("net_arbo", n), instruction={
+
+	tmpArboRes <- rblapply(names(in_data_selections), function(n) {
+	  arboRes <- versionedCache(paste_("net_arbo", n), buildEnvir=list(
+  	  all_tfs=all_tfs,
+  	  sc_data=sc_data[, in_data_selections[[n]]]
+  	))
+		return(as.data.table(arboRes))
+	}, "i")
+
+	setkey(tmpArboRes, i, TF, target)
+	tmpArboRes <- tmpArboRes[CJ(names(in_data_selections), tmpArboRes[,unique(TF)], tmpArboRes[,unique(target)])]
+	# --> fill non-listed results with 0's:
+	tmpArboRes[is.na(importance), importance:=0]
+
+	tmpArboRes <- tmpArboRes[, .(importance=mean(importance)), by=.(TF,target)][importance>0,]
+
+	return(tmpArboRes)
+
+}, buildEnvir=list(
+  all_tfs=allTFs,
+  in_data_selections=inDataSelections,
+  sc_data=scDataF$d[allGenes, ]
+))
+
+inDataSelections <- list(n=NA)
+names(inDataSelections) <- n
+	
+```
+
+
+# Determine top targets per TF
+
+Use the GRNBoost results from above:
+
+```{r extend_grnboost}
+arboRes <- as.data.table(arboRes)
+arboRes[, log_importance:=log2(importance+1)]
+arboRes[, id:=paste0(TF,"--",target)]
+
+print(head(arboRes))
+```
+
+Merge GRNBoost predictions (based on scRNA-seq) with motif-peak-gene links (based on ATAC-seq):
+
+```{r merge_nets}
+mNet <- merge(arboRes[,.(from=TF, to=target, id, importance, log_importance)], net, by=c("from","to","id"), all.x=T)
+print(head(mNet))
+```
+
+Collapse multiple putative interactions by TF-target:
+
+```{r collapse_net}
+mNetCollapsed <- merge(mNet[, .(importance=unique(importance), has_peak=sum(!is.na(rid))>0), by=.(from, to)], tfTargetCors, by=c("from", "to"))
+mNetCollapsed[, imp_rank := rank(-importance, ties.method="random"), by=from]
+mNetCollapsed[, cor_rank := rank(-abs(pearson), ties.method="random"), by=from]
+mNetCollapsed[, tf_target := to%in%allTFs, by=to]
+mNetCollapsed[, dir := sign(pearson)]
+mNetCollapsed[, reg_dir := ifelse(`dir`>0, "act", "inh")]
+mNetCollapsed[, label := paste_(reg_dir, from)]
+
+print(head(mNetCollapsed))
+```
+
+Plot importance vs. correlation:
+
+```{r cor_v_imp}
+pData <- mNetCollapsed[order(imp_rank),]
+pData[, reg_dir := ifelse(dir<0, names(COLOR_PALETTES$reg_dir)[1], names(COLOR_PALETTES$reg_dir)[2])]
+pData[abs(pearson)<=MIN_PEARSON, reg_dir := names(COLOR_PALETTES$reg_dir)[3]]
+#p <- (ggplot(pData[sample(nrow(pData),200000),], aes(x=log2(importance+0.1), y=pearson)) + geom_point(shape=".") + geom_density_2d()) + (ggplot(pData[sample(nrow(pData),200000),], aes(x=imp_rank, y=cor_rank)) + geom_point(shape=".") + geom_density_2d()) + (ggplot(pData[sample(nrow(pData),200000),], aes(x=imp_rank, y=cor_rank)) + geom_point(shape=".") + geom_density_2d() + xlim(0,2500) + ylim(0,2500))
+
+print(head(pData))
+#print(p)
+
+```
+
+Use changepoint analysis to determine appropriate cutoffs on the importance score (per TF):
+
+```{r changepoints}
+pDataX <- pData[has_peak==T & is.finite(importance) & is.finite(imp_rank),]
+pDataX[, importance_capped := abscap(importance), by=from] # abscap to crop off outliers
+
+impThreshs <- rblapply(pDataX[from%in%allTFs, sort(unique(from))], function(tf) {		
+	pDataSel <- pDataX[from==tf,]
+	
+	x <- as.numeric(pDataSel[order(imp_rank), importance_capped])
+	
+	if(length(x) < 3) return(data.table(thresh=Inf))
+	
+	i <- changepoint::cpts(changepoint::cpt.mean(x)) 
+	i <- i[1]
+	
+	if(is.finite(x[i])) {
+  	p <- ggplot(pDataSel, aes(x=(imp_rank), y=importance_capped, color=reg_dir)) + ggrastr::geom_point_rast(size=0.5, data=pDataSel[reg_dir=="marginal",]) + defTheme(topLegend=TRUE) + coord_cartesian(xlim=c(0,2500)) + xlab("Importance rank") + ylab("GRNBoost2 importance") + scale_color_manual(values=COLOR_PALETTES$reg_dir) + ggtitle(tf)
+  	p <- p + geom_point(size=0.5, shape=1, data=pDataSel[reg_dir!="marginal",]) 
+  	p <- p + geom_hline(yintercept=x[i], linetype="dashed") + annotate(geom="text", x=1, y=x[i], label=round(x[i],1))
+  	
+  	print(p)
+	}	
+	return(data.table(thresh=x[i]))
+}, "tf", cores=config$n_threads_max)
+
+impThreshs <- impThreshs[is.finite(thresh),]
+print(impThreshs)
+
+impThreshs <- with(impThreshs, structure(thresh, names=tf))
+```
+
+Plots predicted target genes for assorted TFs related to NB or (t)NC development (Supplementary Fig. 13a):
+
+```{r sel_tf_plots, fig.width=18, fig.height=8}
+selTFlist <- sort(unique(c("SOX10", "SOX4", "SOX5", "SOX2", "TFAP2B", "TFAP2A", "TFAP4", "ZIC2", "ZIC3", "HOXB3", "HOXD3", "HOXA9", "HOXB8", "HOXB7", "LEF1", "PAX3", "NR1D1", "NR2F1", "NR2F2", "NR2F6", "CDX1", "CDX2", "PHOX2B", "PHOX2A", "NEUROD1", "ONECUT1", "ONECUT3", "POU4F1", "NHLH1", "ASCL1", "TCF7L1", "ISL1", "INSM1", "FOXD3", "FOXB1", "ETS1", "SIX1", "JUN", "HMGA1", "HOXB7", "HOXD3", "HOXB3", "RFX4")))
+
+pDataX <- pData[has_peak==T & from%in%selTFlist,]
+pDataT <- pDataX[tf_target==T, ][order(imp_rank),head(.SD, n=5), by=from]
+
+pNetImp <- ggplot(pDataX, aes(x=(imp_rank), y=importance, color=reg_dir)) + 
+	ggrastr::geom_point_rast(size=0.5, shape=1) + 
+	ggrepel::geom_text_repel(aes(label=to), data=pDataT, max.overlaps=100, size=2.5, min.segment.length = unit(0, 'lines')) + 
+	defTheme(topLegend=TRUE) + facet_wrap(~factor(from,levels=selTFlist), nrow=3, scales="free_y") + coord_cartesian(xlim=c(0,2500)) + xlab("Top 2500 targets by importance rank") + ylab("GRNBoost2 importance") + 
+	scale_color_manual(values=COLOR_PALETTES$reg_dir)
+
+ggsave(filename = figuresDir("figure_atac_net_importance.pdf"), plot = pNetImp, width = 12, height = 6, dpi = 600, unit = "in")
+fwrite(pDataX[, .(from, to, importance=round(importance,2), imp_rank, reg_dir, tf_target=tf_target*1)], file = figuresDir("figure_atac_net_importance_data.csv"))
+
+print(pNetImp)
+```
+
+Plot MYCN targets as an example (Fig. 10b):
+
+```{r sel_tf_plots_2}
+pDataX <- pData[has_peak==T & from=="MYCN",]
+pDataT <- pDataX[tf_target==T, ][order(imp_rank),head(.SD, n=5)]
+p <- ggplot(pDataX, aes(x=(imp_rank), y=importance, color=reg_dir)) + ggrastr::geom_point_rast(size=0.5, data=pDataX[reg_dir=="marginal",]) + geom_point(size=0.5, shape=1, data=pDataX[reg_dir!="marginal",]) + ggrepel::geom_text_repel(aes(label=to), data=pDataT, max.overlaps=100, min.segment.length = unit(0, 'lines')) + defTheme(topLegend=TRUE) + coord_cartesian(xlim=c(0,2500)) + xlab("Top 2500 targets by importance rank") + ylab("GRNBoost2 importance") + scale_color_manual(values=COLOR_PALETTES$reg_dir)
+
+ggsave(filename = figuresDir("figure_atac_net_importance_mycn.pdf"), plot = p, width = 3, height = 2.5, dpi = 600, unit = "in")
+fwrite(pDataX[, .(from, to, importance=round(importance,2), imp_rank, reg_dir, tf_target=tf_target*1)], file = figuresDir("figure_atac_net_importance_mycn_data.csv"))
+
+print(p)
+```
+Extract lists of target genes for each TF:
+
+```{r tf_target_sets}
+targetSets <- mNet[from%in%allTFs & importance>=impThreshs[from] & !is.na(rid), .(id, from, to, rid, importance)]
+targetSets <- merge(targetSets, tfTargetCors[abs(pearson)>MIN_PEARSON,], by=c("from", "to"))
+targetSets <- targetSets[, .(set_name=paste_(ifelse(sign(pearson)>0, "act", "inh"), from), tf_name=from, to, pearson, importance)]
+fwrite(unique(targetSets[, .(set_name, tf_name, to, pearson=round(pearson,2), importance=round(importance,2))]), figuresDir("supp_tbl_tftargets.csv.gz"))
+targetSets <- sapply(split(targetSets$to, f=targetSets$set_name), unique)
+
+print(sapply(targetSets, length))
+```
+
+Calculate TF-to-target module scores:
+
+```{r tf_target_scores}
+targetModScores <- versionedCache(paste_("tf_scores", n), instruction={
+	return(calculateModuleScore(sc_data, target_sets, nthread=config$n_threads_max))
+}, buildEnvir=list(
+  sc_data=scDataF$d,
+  target_sets=targetSets
+))
+print(head(targetModScores))
+```
+
+
+Then plot UMAPs with TF-to-target module scores (use MYCN as an example, Fig. 10c):
+
+```{r tf_target_umap_mycn}
+pDataX <- as.data.table(scDataF$umap, keep.rownames="cell_id")
+pDataX <- merge(pDataX, scDataF$meta, by="cell_id")
+tmp <- as.matrix(t(as.matrix(scDataF$d[unique(c("MYCN",selTFlist)), pDataX$cell_id])))
+colnames(tmp) <- paste_("g",colnames(tmp))
+pDataX <- cbind(pDataX, tmp)
+
+
+pDataX <- cbind(pDataX, targetModScores[pDataX$cell_id,])
+
+set.seed(42)
+pDataX <- pDataX[sample(nrow(pDataX),10000), ] # sample for plotting
+
+
+p <- ggplot(pDataX, aes(x=UMAP_1, y=UMAP_2, color=act_MYCN)) + ggrastr::geom_point_rast(size=1) + defTheme() + viridis::scale_color_viridis(option="turbo")
+
+ggsave(filename = figuresDir("figure_atac_targets_umap_mycn.pdf"), plot = p, width = 4, height = 2.5, dpi = 600, unit = "in")
+fwrite(pDataX[, .(cell_id, UMAP_1=round(UMAP_1,2), UMAP_2=round(UMAP_2,2), act_MYCN=round(act_MYCN,3))], file = figuresDir("figure_atac_targets_umap_mycn_data.csv"))
+
+print(ggplot(pDataX, aes(g_MYCN, act_MYCN)) + geom_point() + defTheme())
+
+print(p)
+```
+
+Plot additional target score UMAPs (Supplementary Fig. 13b):
+
+```{r tf_target_umaps, fig.width=8, fig.height=12}
+pDataXX <- melt(pDataX, measure.vars=intersect(paste_("act", selTFlist), colnames(pDataX)))
+pDataXX[, tf_name := gsub("(act|in.)_(.+)$", "\\2", variable)]
+pTgtScores <- ggplot(pDataXX, aes(x=UMAP_1, y=UMAP_2, color=value)) + ggrastr::geom_point_rast(size=0.5) + defTheme() + viridis::scale_color_viridis(option="turbo") + facet_wrap(~factor(tf_name,levels=c("MYCN",selTFlist)), nrow=4)
+
+ggsave(filename = figuresDir("figure_atac_targets_umap_other.pdf"), plot = pTgtScores, width = 6, height = 6, dpi = 600, unit = "in")
+fwrite(pDataXX[, .(tf_name, cell_id, UMAP_1=round(UMAP_1,2), UMAP_2=round(UMAP_2,2), value=round(value,3))], file = figuresDir("figure_atac_targets_umap_other_data.csv"))
+
+
+print(pTgtScores)
+```
+
+
+
+## TF-to-target enrichments
+
+Perform hypeR enrichment analysis of TF target gene lists (`targetsets`) vs. genes related to the mutation score (`mutGenes` --> from scRNA-seq analysis):
+
+```{r tf_target_enrich}
+targetEnrichRes <- rblapply(split(mutGenes$gene, f=mutGenes$grp), function(mod) {
+	as.data.table(canceRbits::cb_hyper(mod, background = rownames(scDataF$d), genesets = targetSets, collapse=F, min_size=0, max_size=Inf, verbose=F))
+}, "grp") 
+targetEnrichRes[, perc:=overlap/signature]
+targetEnrichRes[, perc_bg:=geneset/background]
+targetEnrichRes[, log2odds:=log2(perc/perc_bg)]
+targetEnrichRes[!is.finite(log2odds), log2odds:=targetEnrichRes[is.finite(log2odds),min(log2odds,na.rm=T)]*1.1]
+targetEnrichRes[, padj:=fdr]
+targetEnrichRes[, sig:=is.finite(log2odds) & is.finite(padj) & is.finite(perc) & padj<=ENRICH_P & perc>=ENRICH_MIN_PERC & abs(log2odds)>=ENRICH_ODDS]
+targetEnrichRes[, mlogp:=-log10(pval)]
+targetEnrichRes[, perc100:=perc*100]
+targetEnrichRes[, mlog2odds:=-log2odds]		
+targetEnrichRes[, stage:=gsub("(D\\d+)_(\\d+)", "\\1", grp)]
+targetEnrichRes[, tclus:=gsub("(D\\d+)_(\\d+)", "\\2", grp)]
+
+print(head(targetEnrichRes))
+
+tbl <- targetEnrichRes[sig==TRUE & grepl("act_",label), .(module_id=grp, label, n_module=signature, n_database=geneset, n_overlap=overlap, n_background=background, pval=round(pval,4), padj=round(padj,4))] #database="mutation_correlated_genes", short_label=label, 
+fwrite(tbl, file=figuresDir("supp_tbl_tftarget_enrichments.csv.gz"))
+```
+
+Plot heatmaps with enrichment results (Fig. 10d):
+
+```{r tf_target_enrich_plots, fig.width=16}
+stg <- "D9"
+hmData <- dtToDf(dcast(targetEnrichRes[stage==stg,], grp~label, value.var="perc100"))
+hmData <- as.matrix(hmData[, targetEnrichRes[stage==stg & sig==T, unique(label)]])
+i <- grepl("inh_",colnames(hmData))
+hmData[,i] <- -1 * hmData[,i]
+
+i <- grepl("inh_",colnames(hmData))
+hmData <- hmData[,!i]
+colnames(hmData) <- gsub("act_","",colnames(hmData))
+hm <- ComplexHeatmap::pheatmap(hmData, main=stg, cellwidth=8, cellheight=10, col=circlize::colorRamp2(seq(-absmax(hmData), absmax(hmData), length.out=5), rev(RColorBrewer::brewer.pal(5,"RdBu"))))
+
+ComplexHeatmap::draw(hm)
+
+pdf(figuresDir("figure_atac_net_heatmap_",stg,".pdf"), width=12, height=8)
+ComplexHeatmap::draw(hm)
+dev.off()
+
+fwrite(as.data.table(hmData, keep.rownames=T), figuresDir("figure_atac_net_heatmap_",stg,"_data.csv"))
+```
+
+Plot target scores vs. mutation score (for selected positively/negatively correlated TFs; line plots from Fig. 10e):
+
+```{r mutscore_v_targetscore}
+stg <- "D9"
+print(stg)
+
+tfSel <- list(
+	down_cna=c("act_NEUROD1", "act_ONECUT1", "act_ONECUT3", "act_ISL1", "act_INSM1", "act_NHLH1"),
+	down_mycn=c("act_TFAP2B", "act_NR2F1", "act_SOX10",  "act_SOX5", "act_HOXB7", "act_PAX3"),
+	up_cna=c("act_HOXB3", "act_HOXD3", "act_CDX1", "act_CDX2", "act_FOXB1", "act_RFX4"),
+	up_mycn=c("act_MYCN", "act_ZIC2", "act_NR1D1", "act_TFAP4", "act_SOX2", "act_LEF1")
+)
+tfNames <- unique(gsub("(act|in.)_","",unlist(tfSel)))
+
+
+tfExpr <- as.data.table(melt(as.matrix(scDataF$d[tfNames,])))
+setnames(tfExpr, c("tf_name", "cell_id", "tf_expr"))
+
+
+cellIds <- intersect(metaMutScore[stage==stg,][order(nnmutscore), cell_id], rownames(targetModScores))
+pData <- as.data.table(targetModScores[cellIds, ], keep.rownames="cell_id")
+pData <- pData[, n:=1:.N]
+
+pData <- melt(pData, measure.vars=intersect(unlist(tfSel), colnames(pData)))
+pData[, reg_dir := ifelse(grepl("act", variable), "act", "inh")]
+pData[, tf_name := gsub("(act|in.)_(.+)$", "\\2", variable)]
+
+pData <- merge(pData, tfExpr, by=c("cell_id", "tf_name"))
+pData <- cbind(pData, metaMutScore[pData$cell_id,.(nnmutscore, stage, condition)])
+
+pData <- merge(pData, melt(tfSel), by.x="variable", by.y="value")
+
+pData[, gene_symbol := gsub("act_","",variable)]
+
+lineCols <- c(
+  getColors(tfSel[["down_cna"]], "YlGn"),
+  getColors(tfSel[["down_mycn"]], "PuBu"),
+  getColors(tfSel[["up_cna"]], "YlOrBr"),
+  getColors(tfSel[["up_mycn"]], "RdPu")
+)
+names(lineCols) <- gsub("act_", "", names(lineCols))
+
+p1 <- ggplot(pData, aes(x=n)) + geom_smooth(aes(y=value, color=gene_symbol)) + 
+		ggtitle(stg) + ylab("TF target module score") + xlab("Mutation score rank") + 
+		defTheme(topLegend=T, noLegendTitle=T) + 
+		ggrastr::geom_tile_rast(aes(fill=condition, y=-0.2, x=n-0.5), height=0.1, width=1, alpha=1, data=unique(pData[,.(n,condition, L1)])) +
+		facet_wrap(~L1, scales="fixed", nrow=2) + 
+    scale_color_manual(values=lineCols) + 
+		scale_fill_manual(values=COLOR_PALETTES$condition[pData[,unique(condition)]], guide="none")
+print(p1)
+
+ggsave(filename = figuresDir("figure_atac_lines_", stg, ".pdf"), plot = p1, width = 6, height = 6, dpi = 600, unit = "in")
+fwrite(pData[,.(rnk=n, value=round(value, 4), gene_symbol, condition)], figuresDir("figure_atac_lines_", stg, "_data.csv"))
+```
+
+
+Plot gene-regulatory networks for visualization of putative interactions (Fig. 10f):
+
+```{r grns_1, fig.width=16, fig.height=8}
+stg <- "D9"
+
+print(stg)
+tfSel <- targetEnrichRes[grepl(stg,grp) & sig==T & grepl("act_",label), ]
+tfSel[, tf_name := gsub("(act|in.)_","",label)]
+tfNames <- unique(tfSel$tf_name)
+
+
+curTargets <- mutGenes[stage==stg, gene]
+	
+allCellIds <- intersect(metaMutScore[,cell_id], colnames(scDataF$d))
+scaledExpr <- t(apply(as.matrix(scDataF$d[unique(c(tfNames, curTargets)),allCellIds,drop=F]),1,scale))
+rownames(scaledExpr) <- unique(c(tfNames, curTargets))
+colnames(scaledExpr) <- allCellIds
+
+actTFs <- grep("act_", colnames(targetModScores), value=T)
+scaledTargetScore <- t(apply(as.matrix(t(targetModScores[allCellIds,actTFs,drop=F])),1,scale))
+rownames(scaledTargetScore) <- gsub("act_","",actTFs)
+colnames(scaledTargetScore) <- allCellIds
+
+cellIdsSplit <- metaMutScore[stage==stg & cell_id%in%colnames(scDataF$d),]
+cellIdsSplit <- split(cellIdsSplit$cell_id, f=cellIdsSplit$condition)
+selCellIdsBins <- CONDITION_ORDER
+
+exprThresh <- 0.0
+exprMinPerc <- 0.2
+
+states <- sapply(cellIdsSplit[selCellIdsBins], function(cellIds){
+	rowMeans(as.matrix(scDataF$d[unique(c(tfNames, curTargets)),cellIds,drop=F])>exprThresh)
+})
+statesScaled <- sapply(cellIdsSplit[selCellIdsBins], function(cellIds){
+	rowMeans(scaledExpr[unique(c(tfNames, curTargets)),cellIds,drop=F])
+})
+statesTargetScore <- sapply(cellIdsSplit[selCellIdsBins], function(cellIds){
+	colMeans(targetModScores[cellIds,,drop=F])
+})
+statesTargetScore <- statesTargetScore[grepl("act_",rownames(statesTargetScore)),]
+rownames(statesTargetScore) <- gsub("act_","",rownames(statesTargetScore))
+statesTargetScoreScaled <- sapply(cellIdsSplit[selCellIdsBins], function(cellIds){
+	rowMeans(scaledTargetScore[,cellIds,drop=F])
+})
+		
+netData	<- mNetCollapsed[label%in%tfSel$label & (pearson)>MIN_PEARSON & to%in%c(tfNames, curTargets) & has_peak==T & importance>=impThreshs[from],]	
+netData[, reg_dir:=ifelse(`dir`>0, names(COLOR_PALETTES$reg_dir)[2], names(COLOR_PALETTES$reg_dir)[1])]
+netData[, label:=paste_(ifelse(`dir`>0, "act", "inh"), from)]
+
+allNetGenes <- unique(c(netData$from, netData$to))
+
+
+loAlg <- "layout_with_fr"
+library(igraph)
+
+nnet <- graph_from_data_frame(d=as.data.frame(netData[,.(x=from, y=to, id=paste0(from, "--", to), from, to, reg_dir, dir, label)]), vertices=data.frame(id=allNetGenes, name=allNetGenes), directed=TRUE)
+
+msg(loAlg)
+		
+lo <- versionedCache("atac_net_layout", instruction={
+	lo <- get(lo_alg)(nnet)
+	lo <- norm_coords(lo, ymin=-1, ymax=1, xmin=-1, xmax=1)			
+	rownames(lo) <- V(nnet)$name	
+	return(lo)
+}, recreate=F, buildEnvir=list( lo_alg=loAlg, net_genes=allNetGenes, net_cons=netData[, .(from, to)] ))
+
+nodes <- as.data.table(get.vertex.attribute(nnet))
+nodes[, x:=lo[name,1]]
+nodes[, y:=lo[name,2]]	
+nodes[, is_tf:=name%in%netData[,unique(from)]]
+
+edges <- as.data.table(get.edge.attribute(nnet))
+edges[, x:=lo[from,1]]
+edges[, y:=lo[from,2]]
+edges[, x2:=lo[to,1]]
+edges[, y2:=lo[to,2]]
+
+n <- rblapply(colnames(states), function(curState) {
+
+	e <- data.table(edges)
+	n <- data.table(nodes)
+	n[, expr:=states[name,curState]]
+	n[, expr_scaled:=statesScaled[name,curState]]
+	n[, is_active:=expr>=exprMinPerc] 
+	
+	n[name%in%rownames(statesTargetScore), target_score:=statesTargetScore[name,curState]]
+	n[name%in%rownames(statesTargetScoreScaled), target_score_scaled:=statesTargetScoreScaled[name,curState]]
+	
+	e[, expr:=states[from,curState]]
+	e[, expr_to:=states[to,curState]]
+				
+	return(n) 
+}, "state")
+
+n[is_tf==T,]
+
+e <- rblapply(colnames(states), function(curState) {			
+	e <- data.table(edges)
+	e[, expr:=states[from,curState]]
+	e[, expr_scaled:=statesScaled[from,curState]]
+	e[, is_active:=expr>=exprMinPerc] 
+			
+	return(e)
+}, "state")
+
+p <- ggplot(n, aes(x=x, y=y)) + defTheme(topLegend=T) + themeBoxed(axis.ticks=element_blank(), axis.title=element_blank(), axis.text=element_blank()) 
+	
+p <- p + ggrastr::rasterize(geom_segment(aes(xend=x2, yend=y2, color=expr_scaled), alpha=0.8, size=0.5, arrow = arrow(length = unit(0.015, "npc"), type="closed"), data=e[grepl("^act_", label),]), dpi=600)
+p <- p + geom_point(aes(color=expr_scaled), shape=1, size=0.4, data=n[is_tf==F ,])
+p <- p + geom_point(aes(size=2^target_score_scaled, color=expr_scaled), data=n[is_tf==T ,])
+
+p <- p + geom_text(aes(size=2^target_score_scaled, label=name), color="black", data=n[is_tf==T & expr_scaled>=0.05 ,])  
+
+p <- p + scale_size_continuous(range=c(0.01, 5)) + scale_color_gradient2(low="#018571", high="#a6611a", mid="#EEEEEE")
+
+p <- p + ggtitle(sprintf("%s, %s", stg,loAlg))
+
+plot(p + facet_wrap(~factor(state, levels=selCellIdsBins), nrow=1))
+
+ggsave(filename = figuresDir("figure_atac_net_split_", stg, "_", loAlg, ".pdf"), plot = p + facet_wrap(~factor(state, levels=selCellIdsBins), nrow=2), width = 8, height = 8, dpi = 600, unit = "in")
+
+fwrite(n[, .(state, name, x=round(x,3), y=round(y,3), is_tf, is_active, target_score_scaled=round(target_score_scaled,2), expr_scaled=round(expr_scaled, 2))], file = figuresDir("figure_atac_net_split__", stg, "_", loAlg, "_data.csv"))
+fwrite(e[, .(state, from, to, reg_dir, expr_scaled=round(expr_scaled, 2))], file = figuresDir("figure_atac_net_split__", stg, "_", loAlg, "_edges_data.csv"))
+```
+
+Plot the entire GRN (without stage-/condition-specific parameterization) to make it possible to see all node labels (Supplementary Fig. 13c):
+
+```{r grns_2}
+print(stg)
+tfSel <- targetEnrichRes[grepl(stg,grp) & sig==T & grepl("act_",label), ]
+tfSel[, tf_name := gsub("(act|in.)_","",label)]
+tfNames <- unique(tfSel$tf_name)
+
+
+curTargets <- mutGenes[stage==stg, gene]
+	
+allCellIds <- intersect(metaMutScore[,cell_id], colnames(scDataF$d))
+scaledExpr <- t(apply(as.matrix(scDataF$d[unique(c(tfNames, curTargets)),allCellIds,drop=F]),1,scale))
+rownames(scaledExpr) <- unique(c(tfNames, curTargets))
+colnames(scaledExpr) <- allCellIds
+
+actTFs <- grep("act_", colnames(targetModScores), value=T)
+scaledTargetScore <- t(apply(as.matrix(t(targetModScores[allCellIds,actTFs,drop=F])),1,scale))
+rownames(scaledTargetScore) <- gsub("act_","",actTFs)
+colnames(scaledTargetScore) <- allCellIds
+
+statesTargetScore <- colMeans(targetModScores[,,drop=F])
+statesTargetScore <- statesTargetScore[grepl("act_",names(statesTargetScore))]
+names(statesTargetScore) <- gsub("act_","",names(statesTargetScore))
+
+
+netData	<- mNetCollapsed[label%in%tfSel$label & (pearson)>MIN_PEARSON & to%in%c(tfNames, curTargets) & has_peak==T & importance>=impThreshs[from],]	
+netData[, reg_dir:=ifelse(`dir`>0, names(COLOR_PALETTES$reg_dir)[2], names(COLOR_PALETTES$reg_dir)[1])]
+netData[, label:=paste_(ifelse(`dir`>0, "act", "inh"), from)]
+
+allNetGenes <- unique(c(netData$from, netData$to))
+
+library(igraph)
+nnet <- graph_from_data_frame(d=as.data.frame(netData[,.(x=from, y=to, id=paste0(from, "--", to), from, to, reg_dir, dir, label)]), vertices=data.frame(id=allNetGenes, name=allNetGenes), directed=TRUE)
+
+
+msg(loAlg)
+		
+lo <- latestCache("atac_net_layout")
+
+nodes <- as.data.table(get.vertex.attribute(nnet))
+nodes[, x:=lo[name,1]]
+nodes[, y:=lo[name,2]]	
+nodes[, is_tf:=name%in%netData[,unique(from)]]
+
+edges <- as.data.table(get.edge.attribute(nnet))
+edges[, x:=lo[from,1]]
+edges[, y:=lo[from,2]]
+edges[, x2:=lo[to,1]]
+edges[, y2:=lo[to,2]]
+
+n <- data.table(nodes)
+e <- data.table(edges)
+
+n[name%in%names(statesTargetScore), target_score:=statesTargetScore[name]]
+n[is.na(target_score) | target_score<0, target_score:=0]
+
+p <- ggplot(n, aes(x=x, y=y)) + defTheme(topLegend=T) + themeBoxed(axis.ticks=element_blank(), axis.title=element_blank(), axis.text=element_blank()) 
+	
+p <- p + ggrastr::rasterize(geom_segment(aes(xend=x2, yend=y2), alpha=0.8, size=0.5, color="grey", arrow = arrow(length = unit(0.015, "npc"), type="closed"), data=e[grepl("^act_", label),]), dpi=300)
+p <- p + geom_point(aes(size=2^target_score, shape=is_tf), color="grey")
+
+p <- p + geom_text(aes(size=2^target_score, label=name), color="black")
+
+p <- p + scale_size_continuous(range=c(2.5, 8)) + scale_color_gradient2(low=COLOR_PALETTES$reg_dir[1], high=COLOR_PALETTES$reg_dir[2], mid=COLOR_PALETTES$reg_dir[3]) #+ scale_color_manual(values=COLOR_PALETTES$reg_dir) + coord_cartesian(xlim=c(-1,1),ylim=c(-1,1)) 
+
+p <- p + scale_shape_manual(values=c("TRUE"=16, "FALSE"=1))
+p <- p + ggtitle(sprintf("%s, %s", stg,loAlg))
+
+pFullNet <- p
+
+plot(p)
+
+
+
+ggsave(filename = figuresDir("figure_atac_net_", loAlg, ".pdf"), plot = p, width = 6, height = 6, dpi = 600, unit = "in")
+
+fwrite(n[, .(name, x, y, is_tf, target_score=round(target_score,2))], file = figuresDir("figure_atac_net_", loAlg, "_data.csv"))
+fwrite(e[, .(from, to, reg_dir)], file = figuresDir("figure_atac_net_", loAlg, "_edges_data.csv"))
+
+```
+
+Put together in figure (Supplementary Fig. 13)
+
+```{r comb_plots, fig.width=16, fig.height=16}
+px <- pNetImp / (pTgtScores + pFullNet)
+ggsave(filename = figuresDir("figure_atac_targets_supp_all.pdf"), plot = px, width = 12, height = 12, dpi = 600, unit = "in")
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

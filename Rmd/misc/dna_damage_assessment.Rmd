@@ -1,0 +1,367 @@
+---
+title: "DNA damage assessment stats"
+author: "Christoph Hafemeister"
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+# Setup
+```{r}
+source("R/setup_bob.R")
+library('dplyr')
+```
+
+Install missing packages
+```{r}
+BiocManager::install("lme4", update = FALSE)
+BiocManager::install("DHARMa", update = FALSE)
+BiocManager::install("glmmTMB", update = FALSE)
+BiocManager::install("ggh4x", update = FALSE)
+#devtools::install_github("velocyto-team/velocyto.R", ref = '83e6ed9')
+```
+
+Set max threads for BLAS
+```{r}
+BiocManager::install("RhpcBLASctl", update = FALSE)
+RhpcBLASctl::blas_set_num_threads(config$OPENBLAS_NUM_THREADS)
+```
+
+
+# Main
+
+## Read data
+
+```{r}
+f <- file.path(config$out_root, 'dna_damage', 'dnadamage_gamma_h2ax_foci_counts.xlsx')
+# first sheet
+md1 <- readxl::read_xlsx(path = f, sheet = 1, n_max = 3, col_names = FALSE)
+# fix the column-spanning meta data
+for (j in 2:ncol(md1)) {
+  for (k in 1:3) {
+    if (is.na(md1[k, j])) {
+      md1[k, j] <- md1[k, j-1]
+    }
+  }
+}
+md1 <- as.data.frame(t(md1))
+colnames(md1) <- c('day', 'genotype', 'exp_day')
+md1 <- mutate(md1, 
+              MYCN = grepl('MYCN', genotype),
+              genotype = stringr::str_remove_all(genotype, 'MYCN'),
+              exp_day = make.names(exp_day),
+              replicate = paste(day, genotype, MYCN, exp_day, sep = '_')) %>%
+  tibble::rownames_to_column(var = 'column_name')
+
+print(md1)
+
+dat1 <- readxl::read_xlsx(path = f, sheet = 1, skip = 3, col_names = FALSE)
+dat1_table <- reshape2::melt(t(dat1), value.name = 'counts', varnames = c('column_name', 'idx'))
+dat1 <- filter(dat1_table, !is.na(counts)) %>%
+  left_join(md1) %>%
+  mutate(column_name = factor(column_name, levels = md1$column_name),
+         MYCN = factor(MYCN, levels = c(FALSE, TRUE))) %>%
+  arrange(column_name, idx)
+  
+
+# second sheet
+md2 <- readxl::read_xlsx(path = f, sheet = 2, n_max = 2, col_names = FALSE)
+# fix the column-spanning meta data
+for (j in 2:ncol(md2)) {
+  for (k in 1:2) {
+    if (is.na(md2[k, j])) {
+      md2[k, j] <- md2[k, j-1]
+    }
+  }
+}
+md2 <- as.data.frame(t(md2))
+colnames(md2) <- c('genotype', 'exp_day')
+md2 <- mutate(md2, 
+              DOX = grepl('DOX', genotype),
+              genotype = stringr::str_remove_all(genotype, 'DOX|original'),
+              genotype = stringr::str_replace_all(genotype, 'wild type', 'WT'),
+              genotype = stringr::str_trim(genotype),
+              exp_day = make.names(exp_day),
+              replicate = paste(genotype, DOX, exp_day, sep = '_')) %>%
+  tibble::rownames_to_column(var = 'column_name')
+
+print(md2)
+
+dat2 <- readxl::read_xlsx(path = f, sheet = 2, skip = 2, col_names = FALSE)
+dat2_table <- reshape2::melt(t(dat2), value.name = 'counts', varnames = c('column_name', 'idx'))
+dat2 <- filter(dat2_table, !is.na(counts)) %>%
+  left_join(md2) %>%
+  mutate(column_name = factor(column_name, levels = md2$column_name),
+         DOX = factor(DOX, levels = c(FALSE, TRUE))) %>%
+  arrange(column_name, idx)
+
+```
+
+## Model
+
+Test day 14 17q1q: -mycn vs +mycn
+```{r}
+mod_dat <- filter(dat1, day == 'D14', genotype == '17q1q')
+
+library('lme4')
+library('DHARMa')
+fit <- lmer(counts ~ MYCN + (MYCN | replicate), data = mod_dat)
+```
+
+```{r}
+simulationOutput <- simulateResiduals(fittedModel = fit, plot = FALSE)
+plot(simulationOutput)
+```
+
+```{r}
+testZeroInflation(simulationOutput)
+```
+
+```{r}
+fit2 <- glmer(counts ~ MYCN + (MYCN | replicate), data = mod_dat, family = poisson)
+res <- simulateResiduals(fit2)
+plot(res)
+testZeroInflation(res)
+```
+
+```{r}
+fit3 <- glmer(counts ~ MYCN + (1 | replicate), data = mod_dat, family = poisson)
+res <- simulateResiduals(fit3)
+plot(res)
+testZeroInflation(res)
+```
+
+```{r}
+library('glmmTMB')
+fit4 <- glmmTMB(counts ~ MYCN + (1 | replicate), data = mod_dat, family = nbinom1)
+res <- simulateResiduals(fit4)
+plot(res)
+testZeroInflation(res)
+```
+
+```{r}
+fit0 <- glmmTMB(counts ~ (1 | replicate), data = mod_dat, family = nbinom1)
+anova(fit0, fit4)
+```
+
+```{r}
+summary(fit4)
+```
+
+Show expected counts for MYCN FALSE and TRUE, and the effect size
+```{r}
+print(exp(summary(fit4)$coefficients$cond[,1] %*% c(1,1)))
+print(exp(summary(fit4)$coefficients$cond[,1] %*% c(1,0)))
+print(exp(summary(fit4)$coefficients$cond[2,1]))
+```
+
+Do it for all contrasts
+
+```{r}
+# +MYCN vs -MYCN
+res_list <- list()
+for (sel_day in unique(dat1$day)) {
+  for (sel_genotype in unique(dat1$genotype)) {
+    sel_dat <- filter(dat1, day == sel_day, genotype == sel_genotype)
+    fit0 <- glmmTMB(counts ~ (1 | replicate), data = sel_dat, family = nbinom1)
+    fit4 <- glmmTMB(counts ~ MYCN + (1 | replicate), data = sel_dat, family = nbinom1)
+    anova_res <- anova(fit0, fit4)
+    res_list[[length(res_list) + 1]] <- data.frame(
+      day = sel_day,
+      genotype1 = sel_genotype,
+      genotype2 = sel_genotype,
+      MYCN1 = 'FALSE',
+      MYCN2 = 'TRUE',
+      mean1 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,0)),
+      mean2 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,1)),
+      pval = anova_res$`Pr(>Chisq)`[2],
+      logFC = summary(fit4)$coefficients$cond[2,1]
+    )
+  }
+}
+
+
+for (sel_day in unique(dat1$day)) {
+  for (sel_genotype in c('17q', '17q1q')) {
+    for (sel_MYCN in c('FALSE', 'TRUE')) {
+      sel_dat <- filter(dat1, day == sel_day, MYCN == sel_MYCN, genotype %in% c(sel_genotype, 'WT')) %>%
+        mutate(nonWT = factor(!(genotype == 'WT'), levels = c(FALSE, TRUE)))
+      fit0 <- glmmTMB(counts ~ (1 | replicate), data = sel_dat, family = nbinom1)
+      fit4 <- glmmTMB(counts ~ nonWT + (1 | replicate), data = sel_dat, family = nbinom1)
+      anova_res <- anova(fit0, fit4)
+      res_list[[length(res_list) + 1]] <- data.frame(
+        day = sel_day,
+        genotype1 = 'WT',
+        genotype2 = sel_genotype,
+        MYCN1 = sel_MYCN,
+        MYCN2 = sel_MYCN,
+        mean1 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,0)),
+        mean2 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,1)),
+        pval = anova_res$`Pr(>Chisq)`[2],
+        logFC = summary(fit4)$coefficients$cond[2,1]
+      )
+    }
+  }
+}
+```
+
+```{r}
+res1 <- bind_rows(res_list) %>%
+  mutate(day = factor(day, levels = unique(md1$day)),
+         genotype1 = factor(genotype1, levels = c('WT', '17q', '17q1q')),
+         genotype2 = factor(genotype2, levels = c('WT', '17q', '17q1q')),
+         FDR = p.adjust(pval, method = 'fdr')) %>%
+  arrange(day, genotype1, genotype2) %>%
+  mutate(FC = exp(logFC))
+
+```
+
+```{r}
+res1 %>% DT::datatable()
+```
+
+Create a figure
+
+```{r}
+library('ggplot2')
+library('ggh4x')
+
+col_grp_vals <- c('WT-MYCN' = '#808080',
+                  'WT+MYCN' = '#d4d4d4',
+                  '17q-MYCN' = '#00ad67',
+                  '17q+MYCN' = '#20df20',
+                  '17q1q-MYCN' = '#ffa500',
+                  '17q1q+MYCN' = '#ff00ff')
+
+plot_dat <- dat1 %>%
+  mutate(day = factor(day, levels = c('D9', 'D14')),
+         genotype = factor(genotype, levels = c('WT', '17q', '17q1q')),
+         MYCN = case_when(MYCN == 'TRUE' ~ '+MYCN', TRUE ~ '-MYCN'),
+         col_grp = paste0(genotype, MYCN))
+plot_dat_sum <- group_by(plot_dat, day, genotype, MYCN, col_grp, replicate) %>%
+  summarise(counts = mean(counts), n = n())
+yticks <- c(0, 10, 20, 30)
+yticks_minor <- 0:39
+plot_dat %>%
+  ggplot(aes(replicate, log1p(counts), color = col_grp)) +
+  #geom_boxplot() +
+  geom_violin(scale = 'width') +
+  geom_point(data = plot_dat_sum, shape = 23, size = 3, fill = 'black') +
+  facet_nested(~ day + genotype + MYCN, scales = 'free_x', switch = 'x') +
+  theme(legend.position = 'none',
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  ylab('\u0263H2AX foci / cell') +
+  scale_y_continuous(breaks = log1p(yticks), minor_breaks = log1p(yticks_minor), labels = yticks, expand = c(0, 0.03)) +
+  scale_x_discrete(breaks = NULL) +
+  scale_color_manual(values = col_grp_vals)
+
+ggsave(filename = file.path(config$out_root, 'figures', 'figure_dna_damage_MYCN.pdf'), width = 8, height = 2.7, device = cairo_pdf)
+```
+
+
+
+Sheet 2: Do it for all contrasts
+
+```{r}
+res_list <- list()
+for (sel_genotype in unique(dat2$genotype)) {
+  sel_dat <- filter(dat2, genotype == sel_genotype)
+  fit0 <- glmmTMB(counts ~ (1 | replicate), data = sel_dat, family = nbinom1)
+  fit4 <- glmmTMB(counts ~ DOX + (1 | replicate), data = sel_dat, family = nbinom1)
+  anova_res <- anova(fit0, fit4)
+  res_list[[length(res_list) + 1]] <- data.frame(
+    day = 'D14',
+    genotype1 = sel_genotype,
+    genotype2 = sel_genotype,
+    DOX1 = '-DOX',
+    DOX2 = '+DOX',
+    mean1 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,0)),
+    mean2 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,1)),
+    pval = anova_res$`Pr(>Chisq)`[2],
+    logFC = summary(fit4)$coefficients$cond[2,1]
+  )
+}
+
+for (sel_DOX in unique(dat2$DOX)) {
+  sel_dat <- filter(dat2, DOX == sel_DOX) %>%
+    mutate(nonWT = factor(!(genotype == 'WT'), levels = c(FALSE, TRUE)))
+  fit0 <- glmmTMB(counts ~ (1 | replicate), data = sel_dat, family = nbinom1)
+  fit4 <- glmmTMB(counts ~ nonWT + (1 | replicate), data = sel_dat, family = nbinom1)
+  anova_res <- anova(fit0, fit4)
+  res_list[[length(res_list) + 1]] <- data.frame(
+    day = 'D14',
+    genotype1 = 'WT',
+    genotype2 = '17q',
+    DOX1 = sel_DOX,
+    DOX2 = sel_DOX,
+    mean1 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,0)),
+    mean2 = exp(summary(fit4)$coefficients$cond[,1] %*% c(1,1)),
+    pval = anova_res$`Pr(>Chisq)`[2],
+    logFC = summary(fit4)$coefficients$cond[2,1]
+  )
+}
+```
+
+```{r}
+res2 <- bind_rows(res_list) %>%
+  mutate(genotype1 = factor(genotype1, levels = c('WT', '17q')),
+         genotype2 = factor(genotype2, levels = c('WT', '17q')),
+         FDR = p.adjust(pval, method = 'fdr')) %>%
+  arrange(day, genotype1, genotype2) %>%
+  mutate(FC = exp(logFC))
+```
+
+```{r}
+res2 %>% DT::datatable()
+```
+
+Create a figure
+
+```{r}
+col_grp_vals <- c('WT-DOX' = '#808080',
+                  'WT+DOX' = '#d4d4d4',
+                  '17q-DOX' = '#00ad67',
+                  '17q+DOX' = '#20df20',
+                  '17q1q-DOX' = '#ffa500',
+                  '17q1q+DOX' = '#ff00ff')
+
+plot_dat <- dat2 %>%
+  mutate(day = 'D14',
+         genotype = factor(genotype, levels = c('WT', '17q', '17q1q')),
+         DOX = case_when(DOX == 'TRUE' ~ '+DOX', TRUE ~ '-DOX'),
+         col_grp = paste0(genotype, DOX))
+plot_dat_sum <- group_by(plot_dat, day, genotype, DOX, col_grp, replicate) %>%
+  summarise(counts = mean(counts), n = n())
+yticks <- c(0, 10, 20, 30)
+yticks_minor <- 0:39
+plot_dat %>%
+  ggplot(aes(replicate, log1p(counts), color = col_grp)) +
+  #geom_boxplot() +
+  geom_violin(scale = 'width') +
+  geom_point(data = plot_dat_sum, shape = 23, size = 3, fill = 'black') +
+  facet_nested(~ day + genotype + DOX, scales = 'free_x', switch = 'x') +
+  theme(legend.position = 'none',
+        axis.text.x = element_blank(),
+        axis.title.x = element_blank()) +
+  ylab('\u0263H2AX foci / cell') +
+  scale_y_continuous(breaks = log1p(yticks), minor_breaks = log1p(yticks_minor), labels = yticks, expand = c(0, 0.03)) +
+  scale_x_discrete(breaks = NULL) +
+  scale_color_manual(values = col_grp_vals)
+
+ggsave(filename = file.path(config$out_root, 'figures', 'figure_dna_damage_DOX.pdf'), width = 3, height = 2.7, device = cairo_pdf)
+```
+
+
+# Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```

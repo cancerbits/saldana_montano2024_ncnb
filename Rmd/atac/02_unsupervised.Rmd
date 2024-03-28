@@ -1,0 +1,116 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Unsupervised analysis' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+# Intro
+
+In this notebook, we perform a simple principal component analysis of the global chromatin accessibility in all samples and conditions (*Fig. 8c* of the paper).
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(pheatmap)
+library(RColorBrewer)
+```
+
+Load required input data from previous steps:
+
+```{r load_caches}
+dA <- latestCache(CACHE_ATAC_META)
+dds <- latestCache(CACHE_ATAC_DDS)
+```
+
+Normalize count data and remove constant rows:
+
+```{r norm_data}
+dVst <- SummarizedExperiment::assay(DESeq2::vst(dds))
+dVst <- dVst[rowSums(dVst!=0)>0 & apply(dVst,1,sd)>0,] # remove constant rows
+dim(dVst)
+```
+
+
+# Principal component analysis
+
+Run PCA and format results as table combined with sample annotation:
+
+```{r calc_pca}
+pcaRes <- prcomp(t(dVst), scale.=T, center=T)
+pData <- as.data.table(pcaRes$x, keep.rownames="library_name") 
+pData <- merge(pData, dA, by="library_name")
+print(head(pData))
+```
+
+Calculate arrow positions between geometric mean of each timepoint / condition:
+
+```{r calc_arrow_pos}
+arrowData <- rblapply(1:(length(DAY_ORDER)-1), function(i) {
+	s <- DAY_ORDER[i]
+	e <- DAY_ORDER[i+1]
+	
+	arrowData <- merge(pData[day_fac==s, .(srcPC1=median(PC1), srcPC2=median(PC2)), by=.(condition,treatment)], pData[day_fac==e, .(dstPC1=median(PC1), dstPC2=median(PC2)), by=.(condition,treatment)], by=c("condition","treatment"))
+
+	data.table(s=s, e=e, arrowData, actual=TRUE)
+}, "start")
+print(head(arrowData))
+```
+
+Add mock connections for the 17q1qMYCN prior to DOX treatment (= identical to 17q1q):
+
+```{r extend_arrow_data}
+arrowData <- rbind(arrowData, arrowData[condition=="17q1q" & start<3,.(start, s, e, condition="17q1qMYCN", treatment="dox", srcPC1, srcPC2, dstPC1, dstPC2, actual=FALSE)])
+arrowData[condition=="17q1qMYCN" & e=="D9", `:=`(c("dstPC1","dstPC2"),arrowData[condition=="17q1qMYCN" & s=="D9", .(srcPC1,srcPC2)])]
+```
+
+Three different ways of laying out the PCA plots:
+
+```{r plot_pca}
+p <- ggplot(pData, aes(x=PC1, y=PC2, color=day_fac)) + ylab(sprintf("Principal component 2 (%.1f%%)", summary(pcaRes)$importance[2,2]*100)) + xlab(sprintf("Principal component 1 (%.1f%%)", summary(pcaRes)$importance[2,1]*100)) + defTheme(noLegendTitle=T) + geom_point(size=2) + scale_color_manual(values=COLOR_PALETTES$day) + theme(panel.border=element_rect(colour="black", fill=NA))
+print(p)
+
+p <- ggplot(arrowData, aes(x=srcPC1,y=srcPC2,xend=dstPC1,yend=dstPC2,linetype=actual, color=condition)) + ylab(sprintf("Principal component 2 (%.1f%%)", summary(pcaRes)$importance[2,2]*100)) + xlab(sprintf("Principal component 1 (%.1f%%)", summary(pcaRes)$importance[2,1]*100)) + defTheme(noLegendTitle=T) + scale_color_manual(values=COLOR_PALETTES$condition) + geom_segment(data=arrowData, arrow = arrow(type="closed", length = unit(0.03, "npc"))) + scale_linetype_manual(values=c("TRUE"="solid","FALSE"="dashed")) + theme(panel.border=element_rect(colour="black", fill=NA))
+print(p)
+
+p <- ggplot(pData, aes(x=PC1, y=PC2, color=condition)) + ylab(sprintf("Principal component 2 (%.1f%%)", summary(pcaRes)$importance[2,2]*100)) + xlab(sprintf("Principal component 1 (%.1f%%)", summary(pcaRes)$importance[2,1]*100)) + defTheme(noLegendTitle=T)  + scale_color_manual(values=COLOR_PALETTES$condition) + themeBoxed(axis.text=element_blank(), axis.ticks=element_blank(), panel.grid.major=element_line(size=0.25))
+p <- p + geom_point(aes(shape=day_fac),color="black") 
+p <- p + geom_segment(aes(x=srcPC1,y=srcPC2,xend=dstPC1,yend=dstPC2), data=arrowData, alpha=0.75, linejoin="mitre", arrow = arrow(type="closed", length = unit(0.085, "npc"))) + scale_linetype_manual(values=c("TRUE"="solid","FALSE"="dashed"))
+p <- p + facet_wrap(~factor(condition,levels=CONDITION_ORDER), ncol=2)
+print(p)
+```
+```{r}
+ggsave(filename = figuresDir("figure_atac_pca.pdf"), plot = p, width = 6, height = 4, dpi = 600, unit = "in")
+fwrite(pData[,.(condition, day_fac, PC1, PC2)], file = figuresDir("figure_atac_pca_data.csv"))
+```
+
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

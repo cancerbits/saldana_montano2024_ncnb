@@ -1,0 +1,232 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Annotation and enrichment analysis' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we associate ATAC-seq regions with existing annotations for genomic regions, e.g., from large-scale experiments of regulatory elements in differnt tissues or cell lines.
+This information is not directly displayed in the paper figures, but it is used later for enrichment analysis.
+
+All `*_annotate_*.Rmd` notebooks compile metadata for the ATAC-seq peaks peaks which are then used in `08_enrichments.Rmd`.
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(patchwork)
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS)
+```
+
+
+# Load genomic annotations from different sources
+
+```{r load_genome_regs}
+regionAnnotTypes <- c()
+
+msg("Meulemann et al. (2020)")
+# https://www.meuleman.org/research/dhsindex/
+n <- "dhs"
+annot <- versionedCache(n, instruction={
+	# download and read Regulatory Index annotations:
+	dhsIndexF <- getExternalFile("meulemann_2020_DHS_Index_and_Vocabulary_hg38_WM20190703.txt.gz", "https://www.meuleman.org/DHS_Index_and_Vocabulary_hg38_WM20190703.txt.gz")
+	dhsIndex <- fread(dhsIndexF)
+	# convert to GRanges and find overlaps with peaks:
+	dhsIndex <- dtToGr(dhsIndex, chrCol="seqname", metaCols=c("component"))	
+	o <- findOverlaps(dtToGr(peaks_dt), dhsIndex)
+	# collapse multiple overlaps into one string:
+	o <- as.data.table(o)[,.(dhs_type=unique(dhsIndex$component[subjectHits])),by=queryHits][order(dhs_type),.(annot=paste0(dhs_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+regionAnnotTypes <- c(regionAnnotTypes, n)
+
+msg("Zerbino et al. (2015)")
+# http://www.ensembl.org/info/genome/funcgen/regulatory_build.html
+n <- "ensreg"
+annot <- versionedCache(n, instruction={
+	# download and read Regulatory Build:
+  ensRegBuildF <- getExternalFile("zerbino_2015_homo_sapiens.GRCh38.Regulatory_Build.regulatory_features.20210107.gff.gz", "http://ftp.ensembl.org/pub/release-104/regulation/homo_sapiens/homo_sapiens.GRCh38.Regulatory_Build.regulatory_features.20210107.gff.gz")
+	ensRegBuild <- rtracklayer::import(ensRegBuildF)
+	seqlevels(ensRegBuild) <- paste0("chr",seqlevels(ensRegBuild))
+	# find overlaps with peaks:
+	o <- findOverlaps(dtToGr(peaks_dt), ensRegBuild)
+	# collapse multiple overlaps into one string:
+	o <- as.data.table(o)[,.(ensreg_type=unique(ensRegBuild$feature_type[subjectHits])),by=queryHits][order(ensreg_type),.(ensreg_type=paste0(ensreg_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+regionAnnotTypes <- c(regionAnnotTypes, n)
+
+msg("Zhang et al. (2021)")
+# http://catlas.org/humanenhancer/#!/
+# https://www.cell.com/cell/fulltext/S0092-8674(21)01279-4#supplementaryMaterial
+n <- "catlas"
+annot <- versionedCache(n, instruction={
+	# download and read 1.1mio cCRE's:
+	catlasF <- getExternalFile("zhang_2021_cCRE_hg38.tsv.gz", "http://renlab.sdsc.edu/kai/Key_Processed_Data/cCRE_hg38.tsv.gz")
+	catlas <- fread(catlasF)
+	
+	# get simple categorization of cCRE modules (the only place where I found this was the header of a supplementary table with GO enrichments):
+	metaF <- getExternalFile("zhang_2021_cCRE_hg38_meta.xlsx", "https://data.mendeley.com/public-files/datasets/yv4fzv6cnm/files/40c64a61-4e73-42c4-9067-b28c507410d8/file_downloaded")
+	catlasMeta <- readxl::read_xlsx(metaF)
+	if(!identical(as.integer(catlasMeta[1,-1]),1:150)) stop("CRE cluster metadta not ordered as expected")
+	catlasClusts <- tolower(gsub("(\\s|\\&)+","_",gsub("\\.+\\d+$","",colnames(catlasMeta)[-1]))) # strings are in order of cluster number
+		
+	catlas[ , cre_name := paste_("CRE", `CRE module`, catlasClusts[as.numeric(`CRE module`)])]
+		
+	# find overlaps with peaks:
+	o <- findOverlaps(dtToGr(peaks_dt), dtToGr(catlas, "#Chromosome", "hg38_Start", "hg38_End"))
+	# collapse multiple overlaps into one string:
+	o <- as.data.table(o)[,.(catlas_type=unique(catlas$cre_name[subjectHits])),by=queryHits][order(catlas_type),.(catlas_type=paste0(catlas_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+regionAnnotTypes <- c(regionAnnotTypes, n)
+
+msg("Gao et al. (2019)")
+# https://academic.oup.com/nar/article/48/D1/D58/5628925
+# http://www.enhanceratlas.org/index.php
+n <- "enhatlas"
+annot <- versionedCache(n, instruction={
+	# download and read 1.1mio cCRE's:
+	tmp <- getExternalFile("enhanceratlas_2.0_Species_enhancer.RData", "http://www.enhanceratlas.org/data/download/Species_enhancer.RData")
+	tmp <- load(tmp)
+	rm(list=setdiff(tmp,"HS")) # keep only human
+
+	dt <- data.table(HS[,1])
+	dt[, c("chrom","start", "end") := tstrsplit(V1, "[:-]", fixed=FALSE)]
+	dt[, i:=1:.N]
+		
+	gr <- unlist(liftOver(dtToGr(dt, metaCols="i"), from="hg19"))
+		
+	iToCelltypes <- as.data.table(reshape2::melt(sapply(colnames(HS)[-1], function(x) {
+		 which(HS[,x]>=25) # arbitrary definition of what constitutes and active enhancer (also I don't really know what the numbers mean, as it's not described anywhere)
+	}, simplify=FALSE)))
+	
+	iToCelltypes[, .N, by=L1]
+
+	# find overlaps with peaks:
+	o <- unique(as.data.table(findOverlaps(dtToGr(peaks_dt), gr))[, .(queryHits, i=gr$i[subjectHits])])
+	
+	# merge with cell type annotations:
+	o <- merge(o, iToCelltypes, by.x="i", by.y="value", allow.cartesian=TRUE)
+	
+	# collapse multiple overlaps into one string:
+	o <- o[order(L1),.(enhatlas_type=paste0(L1, collapse=";")), by=.(rid=peaks_dt$rid[queryHits])]
+	
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+regionAnnotTypes <- c(regionAnnotTypes, n)
+
+msg("Vu & Ernst (2020)")
+# https://github.com/ernstlab/full_stack_ChromHMM_annotations
+n <- "chromhmm"
+annot <- versionedCache(n, instruction={
+	# download and read Regulatory Index annotations:
+	chromhmmF <- getExternalFile("hg38lift_genome_100_segments.bed.gz", "https://public.hoffman2.idre.ucla.edu/ernst/1G6UT/hg38lift_genome_100_segments.bed.gz")
+	chromhmm <- fread(chromhmmF)
+	setnames(chromhmm, c("chrom","start","end","chromhmm"))
+	# convert to GRanges and find overlaps with peaks:
+	chromhmm <- dtToGr(chromhmm, metaCols=c("chromhmm"))	
+	o <- findOverlaps(dtToGr(peaks_dt), chromhmm)
+	# collapse multiple overlaps into one string:
+	o <- as.data.table(o)[,.(chromhmm_type=unique(chromhmm$chromhmm[subjectHits])),by=queryHits][order(chromhmm_type),.(annot=paste0(chromhmm_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+regionAnnotTypes <- c(regionAnnotTypes, n)
+```
+
+# Add genomic annotations to peaks
+
+```{r summarize_genome_regs}
+unannotLabel <- "Unannotated"
+regionAnnots <- list()
+
+enrichmentDatabases <- list()
+
+for(n in regionAnnotTypes) {
+	# load peak-region mappings:
+	o <- latestCache(n)
+	setnames(o, c("rid", paste_(n,"type")))
+
+	# add to peak annotation table:
+	suppressWarnings(peaksDt[, paste_(n,"type"):=NULL])
+	peaksDt <- merge(peaksDt, o, by="rid", all.x=T)
+	peaksDt[is.na(get(paste_(n,"type"))), paste_(n,"type"):=unannotLabel]
+		
+	# overview plots:
+	pData <- peaksDt[,.N,by=.(agg_by=get(paste_(n, "type")))]	
+	pData[!agg_by%in%pData[N>=100, agg_by], agg_by:="Other"]
+	pData <- pData[, .(N=sum(N)), by=agg_by]
+	p1 <- ggplot(pData, aes(x=N, y=reorder(agg_by, N))) + geom_bar(stat="identity", fill="black") + defTheme() + ylab(NULL) + scale_x_continuous(expand=c(0,0))	
+	ssplit <- sapply(peaksDt[,get(paste_(n, "type"))], strsplit, split=";")	
+	pData2 <- as.data.table(table(unlist(ssplit, use.names=FALSE)))[order(-N), .(agg_by=V1, N)]
+	pData2[!agg_by%in%pData2[N>1, agg_by], agg_by:="Other"]
+	pData2 <- pData2[, .(N=sum(N)), by=agg_by]
+	p2 <- ggplot(pData2, aes(x=N, y=reorder(agg_by, N))) + geom_bar(stat="identity", fill="black") + defTheme() + ylab(NULL) + scale_x_continuous(expand=c(0,0))
+	print(p1+p2)
+	regionAnnots[[paste_(n,"type")]] <- pData2[order(-N), agg_by]
+			
+	# save annotations for use in follow-up analysis (i.e., enrichment analysis):
+	listNames <- setdiff(regionAnnots[[paste_(n,"type")]], unannotLabel)
+	enrichmentDatabases[[paste_("regions",n,"type")]] <- list(
+		lists = parallel::mclapply(listNames, function(curCat) {
+			peaksDt$rid[sapply(ssplit, function(x) curCat%in%x)]
+			#peaksDt[grepl(curCat, get(paste_(n,"type"))), rid]
+		}, mc.cores=12),
+		univ = peaksDt[get(paste_(n,"type"))!=unannotLabel,rid]	# all peaks with at least one annotated overlap
+	)
+	names(enrichmentDatabases[[paste_("regions",n,"type")]]$lists) <- listNames
+	
+}
+```
+
+Save annotation for later use:
+
+```{r save_genome_annots}
+db <- versionedCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "regions"), instruction={
+  return(enrich_dbs)
+}, buildEnvir=list(
+  enrich_dbs=enrichmentDatabases
+))
+
+print(sapply(db, function(x) sapply(x$lists,length)))
+```
+
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

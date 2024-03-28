@@ -1,0 +1,1642 @@
+title: "Saldana, Montano, et al. -- scRNA-seq: 06_WT_projecting_patients' cells_onto_wildtype"
+author: "Luis Montano"
+date: '2023-08-07'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+  outpath: '~/mnt_out/figures/'
+  resourcepath: "~/mnt_resources/"
+  infercnvpath: '~/path/to/input_data/infercnv/'
+  gtfpath: '~/path/to/gencode.v40.annotation.gtf.gz'
+  downloadedfilepath: '~/path/to/downloaded_files/'
+  fig_width: 6
+  fig_height: 4
+---
+
+# Characterisation of the full dataset.
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R It requires the seurat_WT_processed_clusters_markers.RData seurat object produced previously as well as the output of scrna/03...Rmd.
+
+## Outputs
+
+* Mapping data from patients to wt and lists of shared markers between patients and our dataset, to be used later.
+* Contents of figures 7 and Supplementary figure 10
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load functions and relevant variables, and prepare workspace
+
+```{r}
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+vfeatures=5000
+pcdims=30
+umapdims=10
+sz=.02
+tsca=200
+
+################################################################################
+# setting UMAP parameters
+################################################################################
+  wtumapdims=10
+  wtnn=30
+  wtag="WT"
+  wtmd=0.4
+  pval=0.05
+  padj=pval
+  minfc=.3
+  fdr=0.05
+  selecttop=250
+  ncells.show=200
+  method.markers="deseq"
+  method.seriate="seurat"
+  clusvarname=""
+################################################################################
+#### comparison heatmap parameters
+################################################################################  
+  numcells=100
+
+################################################################################
+# recreation/ reloading controls
+################################################################################  
+loadcontrols=list()
+  loadcontrols$wtmarkers=list(
+ loadfulldata="reload",
+ processraw="reload",
+ calculateclusters="recreate"
+  )
+################################################################################
+#glasswork plot parameters
+################################################################################
+gwvarr="stage"
+
+  sca=10
+  rr=600
+  ssca=200
+  varrlab=gwvarr
+  sca=10
+  rr=600
+  ssca=180
+  hullpointsize=0.05
+  linesize=0.1
+  fillvar="clusterfrac"
+
+plotmeth="jitter"
+
+################################################################################
+# mapped cell analysis
+################################################################################
+
+nmappedcells.show=500
+
+################################################################################
+#
+################################################################################
+lfcvar="log_fc"
+
+################################################################################
+# specific functions
+################################################################################
+
+getmegacluster= Vectorize(function(x){
+  l=lapply(names(clustergroups), function(nm)
+    if(x %in% clustergroups[[nm]]){nm}) %>% Reduce(c, .) 
+  l[[!is.null(l)]]}, USE.NAMES=F)
+
+min.counts=500
+max.mito=20
+qcpars3=list(
+  NB08=list(counts=100, features=0, mito=40, clustersremove=NULL),
+  NB02=list(counts=0, features=0, mito=100, clustersremove=NULL),
+  default=list(counts=500, features=0, mito=40, clustersremove=NULL),
+   allpatients=list(counts = min.counts, features = 0, mito = max.mito, clustersremove = NULL)
+
+)
+
+filterds=function(so){
+  nm=Project(so)
+  if(nm %in% names(qcpars3)){
+    so[, so %>% metadata %>% filter(nCount_RNA>=qcpars3[[nm]]$counts, nFeature_RNA>=qcpars3[[nm]]$features, percent.mt<=qcpars3[[nm]]$mito ) %>% rownames] 
+  }else{
+    so[, so %>% metadata %>% filter(nCount_RNA>=qcpars3[["default"]]$counts, nFeature_RNA>=qcpars3[["default"]]$features, percent.mt<=qcpars3[["default"]]$mito ) %>% rownames] 
+    
+  }
+}
+
+
+getcnvtable3= function(pt){
+  if(pt %in%  (gpmeta  %>% pull(patientID) %>% unique)){
+    msg("group_patient")
+    return(readRDS(paste0(params$infercnvpath, "_anonymised/220913_patient_", pt, "/infercnv.observations.Rds")))
+  }
+}
+
+
+getcounts= function(pt){
+  if(pt %in%  (gpmeta  %>% pull(patientID) %>% unique)){
+    msg("group_patient")
+    return(gpcounts[, gpmeta %>% filter(patientID==pt) %>% rownames])
+  }else{
+    if(pt %in%  (olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% pull(patientID) %>% unique)){
+      msg("olsen patient")
+      return(olsencounts[, olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% filter(patientID==pt) %>% rownames])                               
+    }
+    
+  }
+}
+
+
+getmeta= function(pt){
+  if(pt %in%  (gpmeta  %>% pull(patientID) %>% unique)){
+    msg("group_patient")
+    return(gpmeta[gpmeta %>% filter(patientID==pt) %>% rownames, ])
+  }else{
+    if(pt %in%  (olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% pull(patientID) %>% unique)){
+      msg("olsen patient")
+      return(olsenmeta[ olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% filter(patientID==pt) %>% rownames, ])                                 #  strsplit(pt, split="_")[[1]][2]]])
+    }
+    
+  }
+}
+
+getpt=function(so) so %>% metadata %>% pull(patientID) %>% unique 
+
+
+################################################################################
+# rectifying relevant colors
+################################################################################
+
+allcolors[["study"]]=c( Fetahu2023='#8da0cb',Dong2020='#e78ac3',Jansky2021='#a6d854')
+```
+
+
+Install specific python libraries
+
+```{bash}
+conda 
+pip install leidenalg
+pip install pandas
+```
+
+## Load full, processed dataset
+
+```{r}
+#load integrated single cell experiment wih data across all datasets
+
+fullrecreate=F; fullreload=T
+simpleCache("fulldataset_with_clusters", {sma}, assignToVar="sma", reload=T)
+
+```
+
+## importing wt dataset
+
+```{r loadwt}
+
+simpleCache("seurat_WT_processed_clusters_markers", {scwt}, 
+            reload=T,
+            assignToVar="scwt")
+
+```
+
+
+##  UMAPs of neuroblastoma diagnostic markers
+
+```{r}
+
+nbmarkers=c("NCAM1", "L1CAM", "B4GALNT1", "SYP", "TH", "DDC", "CHRNA3", "GAP43", "DBH", "PROM1","YAP1", "WWTR1")
+
+sca=10
+lapply(nbmarkers, function(x){
+  tpng(path=params$plotpath, paste0("UMAPncnb_nbmarkers_wlegend", x), res=600, he=w*sca, wi=w*sca)
+  print(FeaturePlot(sma, reduction=ur, features=x, cols=c("#EEEEEE33","blue"))+NoAxes())
+  dev.off()
+})
+
+
+################################################################################
+
+# calculating marker specificity
+
+################################################################################
+
+marktable=join_meta_exp(sma, genes=nbmarkers) %>% pivot_longer(., cols=nbmarkers, names_to="gene", values_to="expression")
+
+summar=marktable %>% mutate(isexp=expression>0) %>% group_by(seurat_clusters, gene) %>% summarise(counts=n(), pct.exp=sum(isexp)/counts) %>% as.data.frame
+specificity.ranks=summar %>% group_by(gene) %>% summarise(sum_of_percents= sum(pct.exp), specificity=1/sum_of_percents) %>% arrange(-specificity)
+
+sca=6
+tpng("specificity_score", wi=w*sca, he=w*1.5*sca, res=600)
+ggplot(specificity.ranks, 
+       aes(x=factor(gene, levels=specificity.ranks %>% pull(gene)), y=specificity))+geom_col()+coord_flip()+theme_classic()
+dev.off()
+
+marktable=join_meta_exp(sma, genes=nbmarkers) %>% pivot_longer(., cols=nbmarkers, names_to="gene", values_to="expression")
+
+summar=marktable %>% mutate(isexp=expression>0) %>% group_by(seurat_clusters, gene) %>% summarise(counts=n(), pct.exp=sum(isexp)/counts, mnexp=mean(expression)) %>% as.data.frame
+specificity.ranks=summar %>% group_by(gene) %>% summarise(sum_of_percents= sum(pct.exp), specificity=1/sum_of_percents) %>% arrange(-specificity)
+
+sca=6
+tpng("specificity_stack", wi=w*sca, he=w*1.5*sca, res=600)
+ggplot(summar, 
+       aes(x=factor(gene, levels=specificity.ranks %>% pull(gene)), y=mnexp))+geom_col(position="stack", aes(fill=seurat_clusters))+coord_flip()+theme_classic()+NoLegend()
+dev.off()
+
+
+summars=lapply(nbmarkers, function(x){
+  summar %>% filter(gene==x) %>% arrange(-pct.exp) }
+)
+
+```
+
+### Import pre-assembled single cell data from patients
+
+```{r}
+
+####PATIENT CODES HAVE BEEN ANONYMISED. 
+
+gpmeta=readRDS(paste0(params$inputdata,"ptdatasetsmeta_noqc_anonymised.rds")     )
+gpcounts= readRDS(paste0(params$inputdata,"ptdatasetscounts_anonymised.rds" )  )
+
+```
+
+Provide a human readable name for full dataset clusters called megaclusters. 
+
+```{r}
+
+#removing patients that just have few mycn+ cells
+
+
+clusvarname="seurat_clusters"
+selids=c("Jansky_NB01", "Jansky_NB08", 
+  "Jansky_NB14",
+  "dong_T162", "dong_T200", "dong_T230", 
+  "Fetahu_M2", "Fetahu_M4",
+         "Fetahu_M3", "Fetahu_M1")
+
+allcolors[["patientID"]]=c(Jansky_NB01 = "#9E9C79", Jansky_NB08 = "#F4BE67", Jansky_NB14 = "#92A0CD", 
+dong_T162 = "#55B384", dong_T200 = "#CD0252", dong_T230 = "#6D22B0", 
+Fetahu_M2 = "#8B1750", Fetahu_M4 = "#16EA6E", Fetahu_M3 = "#38724F", 
+Fetahu_M1 = "#231F0B")
+
+
+recreate=F
+rld=T
+cellfilter=3
+ass="RNA"
+allcolors[["mapfun_ccondition"]]=allcolors[["ccondition"]]
+dms=50; re=0.05
+
+plotumaps=F
+plotheatmap=T
+calculatemarkers=T
+makehullplots=F
+
+allcolors[["null"]]=c(one="#FFFFFF00")
+arg=14
+
+################################################################################
+# find cluster correspondences between  clusters and "M" megaclusters
+################################################################################
+
+clustersummary=sma %>% metadata %>% group_by(mutant.clusters, !!sym(clusvarname)) %>% summarise(counts=n()) %>% as.data.frame
+
+megaclus= allcolors[[finalclusvar]] %>% names
+
+clustergroups0=lapply(megaclus, function(x){
+  clustersummary %>% filter(!!sym(finalclusvar)==x) %>% pull(!!sym(clusvarname)) %>% as.character
+  })
+
+### abstracted megacluster labels 
+megacluslabels=c(one="STEMCELLS", two="NMP", three="NC", four="NC_UNDIF", five="MYCN_EARLY", six="SENSORY_CNA", seven="MYCN_MID", eight="SENSORY", nine="MES_UNDIF", ten="SCP_CNA", eleven="MYCN_SCP", twelve="MYCN_LATE", thirteen="SYM", fourteen="MES_SYM", fifteen="MES", sixteen="MES_CNA")
+
+names(clustergroups0)=megacluslabels
+
+## from the above we dput and adjust. moved cluster 30 to MES_SYM
+
+clustergroups=list(STEMCELLS = c("11", "13", "14", "27", "28", "29", "39"), 
+    NMP = c("1", "35", "37"), NC = c("0", "34"), NC_UNDIF = c("10", 
+    "18"), MYCN_EARLY = c("20", "33"), SENSORY_CNA = c("2", "26", 
+    "32"), MYCN_MID = "5", SENSORY = c("8", "24"), MES_UNDIF = c("12", 
+    "15", "38"), SCP = c("3", "9", "25", "36"), MYCN_SCP = "21", 
+    MYCN_LATE = c("19", "22"), SYM = c("4", "31"), MES_SYM = c("30","17"), 
+    MES = c("6", "7", "16"), MES_CNA = "23")
+
+megalevels=c("STEMCELLS", "NMP", "NC", "NC_UNDIF", "MYCN_EARLY", "SENSORY_CNA", 
+"MYCN_MID", "SENSORY", "MES_UNDIF", "SCP", "MYCN_SCP", "MYCN_LATE", 
+"SYM", "MES_SYM", "MES", "MES_CNA")
+
+
+sma@meta.data=sma %>% metadata %>% mutate(megaclusters=getmegacluster(!!sym(clusvarname)))
+
+th=0.6
+
+
+allcolors[["megaclusters"]]= randomcolors(length(megalevels)) %>% givename(., megalevels)
+allcolors[["mapfun_megaclusters"]]= randomcolors(length(megalevels)) %>% givename(., megalevels)
+
+allclusters=allcolors[["WT.clusters"]] %>% names
+clusorder=allclusters
+allcolors[["seurat_clusters"]]= randomcolors(length(allclusters)) %>% givename(., allclusters)
+allcolors[["mapfun_seurat_clusters"]]= randomcolors(length(allclusters)) %>% givename(., allclusters)
+
+```
+
+```{r}
+simpleCache("seurat_ncnb_full_w_megaclusters", {sma}, assignToVar="sma", reload=T)
+```
+
+
+## looping through patients to assemble CNV plots.
+
+
+
+```{r patientcnvgoodloop}
+ if (!exists("gpmeta")) {
+   gpmeta=readRDS(paste0(params$inputdata, "ptdatasetsmeta_noqc_anonymised.rds")     )
+  } 
+ if (!exists("gpcounts")) {
+gpcounts= readRDS(paste0(params$inputdata,"ptdatasetscounts_anonymised.rds")   )
+}
+
+     varr="WT.clusters"
+groupvar="mapfun_WT.clusters"
+ass="SCT"
+recreate=F
+rld=T
+filteroverview=list(beforefilter=list(), afterfilter=list() )
+
+finalcells=list()
+finalmetadata=list()
+
+
+#processing and plotting patient dataset
+
+allplots=lapply(selids, function(ptid){
+  gc()
+  maplist=NULL
+  #require(Azimuth)
+  currentptid<<-ptid
+  fcat("patient ", ptid)
+
+  pt1cells=getmeta(ptid) %>% rownames
+  
+  
+  if(recreate==T || rld==T){
+    simpleCache(paste_("patientseurat", ptid, "cellfilter", cellfilter),{
+      p1=CreateSeuratObject(counts=(getcounts(ptid) %>% as.matrix)[, pt1cells], meta.data= getmeta(ptid) %>% as.data.frame, project=ptid)
+      qcplots(p1, plotname=paste0("qcplots_", ptid), plotsize=200)
+      
+      if(cellfilter==1){   
+        selectedcells=join_meta_exp(p1, genes=c("MYCN", "PTPRC", "CD34", "KDR"), assay="RNA") %>% filter(PTPRC==0, CD34==0, KDR==0) %>% rownames
+        p1=p1[, selectedcells]
+      }
+      if(cellfilter==2){
+        selectedcells=join_meta_exp(p1, genes=c("MYCN", "PTPRC", "CD34"), assay="RNA") %>% filter(PTPRC==0) %>% rownames
+        p1=p1[, selectedcells]
+      }
+      if(cellfilter==3){                                          
+        msg("removing cells with extraneous markers...")
+        #liver  #cortex                     #kidney          #erythroid
+        allcellstab=join_meta_exp(p1, genes=c("MYCN", "PTPRC", "CD34", "AHSG", "STAR", "NR5A1", "KDR", "CYP17A1", "PAX2", "LYPD1", "HBA2"), assay="RNA") 
+        #do not discriminate against kdr positive cells just in case
+        selectedcells=allcellstab %>% filter(PTPRC==0, CD34==0, MYCN>0, AHSG==0, LYPD1==0, HBA2==0, NR5A1==0)%>% rownames
+        filteroverview$beforefilter[[ptid]]<<-nrow(allcellstab)
+        
+        p1=p1[, selectedcells]
+      }
+      
+      p1<<-filterds(p1) #keeping this on the main workspace
+      filteroverview$afterfilter[[ptid]]<<-p1 %>% metadata %>% nrow
+      if (filteroverview$afterfilter[[ptid]]<25){
+        msg("patient has", length(selectedcells), "after filtering. skipping" )
+        next
+      }
+      #})
+      
+      
+      p1=SCTransform(p1, method="glmGamPoi", variable.features.n=6000)
+      p1=NormalizeData(p1, assay="RNA")
+      DefaultAssay(p1)="RNA"
+      p1=ScaleData(p1)
+      
+      p1=FindVariableFeatures(p1, assay="RNA",nfeatures=5000)
+      
+
+      
+      DefaultAssay(p1)=ass
+      
+      
+
+      p1=RunPCA(p1, assay=ass)
+      p1=RunUMAP(p1, dims=1:dms)
+            p1=FindNeighbors(p1, reduction="umap", dims=c(1,2))
+      p1=FindClusters(p1, res=re)
+      ###renaming the assay if it is called RNA
+      
+      p1=RenameAssays(p1, SCT="refAssay")
+      #########
+      #mapping the patient to the new resolution clusters
+      #########
+      
+  allmapcons=lapply(c("seurat_clusters","ccondition", "mutant.clusters" ), function(cvarr){    
+  
+      maplist=maptoref.pt1(query=p1, ref.assay="sctscvi", refdataset=sma, pdms=1:dms, mapvar=cvarr, querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"))
+       mapcon=maptoref.pt2(query=maplist$query,refdataset=maplist$ref, anchors=maplist$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar=cvarr, querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"), reference.umap=ur)
+    
+    mapcon 
+          
+  })
+      
+
+      ### incorporate metadata
+      for(mapcon in allmapcons){
+        p1=AddMetaData(p1, mapcon)
+      }
+      
+
+      msg("Adding megacluster metadata")
+      p1[["mapfun_megaclusters"]]=lapply( p1 %>% metadata %>% pull(mapfun("seurat_clusters")), function(x) getmetacluster(x)) %>% Reduce(c,.)
+      
+      p1[["kamenevatype"]]=p1 %>% metadata %>% select(mapfun_fate2)
+      p1
+    },  assignToVar="p1", recreate=recreate, reload=rld)
+    
+    
+  }else{    
+    simpleCache(paste_("patientseurat", ptid, "cellfilter", cellfilter), assignToVar="p1", reload=T)
+    
+  }
+
+  
+  simpleCache(paste0("mapping_patient_cells_to_wt_clusters_", ptid), {        
+  maplistwt=maptoref.pt1(query=p1, ref.assay="sctscvi", refdataset=scwt, pdms=1:dms, mapvar="WT.clusters", querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"))
+       mapconwt=maptoref.pt2(query=maplistwt$query,refdataset=maplistwt$ref, anchors=maplistwt$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar="WT.clusters", querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"), reference.umap="wtumap.fullscvi822")
+       mapconwt}, assignToVar="mapconwt", reload=rld)
+       
+      p1=AddMetaData(p1, mapconwt)
+  
+  finalcells[[ptid]]<<-colnames(p1)
+  finalmetadata[[ptid]]<<-p1 %>% metadata
+  currentp1<<-p1
+  
+
+  p1=filterps(p1, varbl=varr, th=th)
+  
+
+  
+  
+  
+  
+})
+
+
+
+
+```
+
+
+Mapping Patients' cells to WT reference, all together. 
+
+```{r}
+processid="01-20231123"
+
+fullrecreate=F
+fullreload=T
+salience=T
+get.salience=function(x) x %>% mutate(salience=rate1/rate2)
+sort.by.salience= function(x, gvar) x %>% get.salience %>% group_by(!!sym(gvar)) %>% arrange(-salience, .by_group=T) %>% ungroup %>% as.data.frame
+
+npatient.markers.show=15
+predicted.id.thresh=0.6
+
+
+simpleCache(paste_("seurat_allpatients_mincounts", min.counts, "minmito", max.mito, "nohsc", "id", processid), {
+sopts= CreateSeuratObject(counts=gpcounts, meta.data=gpmeta)
+
+sopts=AddMetaData(sopts, metadata=join_meta_exp(so=sopts, genes=c("MYCN", "TH", "GAP43"), assay="RNA"))
+
+## filter out all possible immune cells
+sopts=sopts[, sopts %>% metadata %>% filter(kamenevatype!="HSC_and_immune") %>% rownames]
+Project(sopts)="allpatients"
+sopts= SCTransform(filterds(sopts), method="glmGamPoi", variable.features.n=5000)
+
+ sopts=RunPCA(sopts)
+ sopts=FindNeighbors(sopts)
+ sopts=FindClusters(sopts)
+ sopts
+}, assignToVar="sopts", recreate=fullrecreate, reload=fullreload)
+
+ annotvars=c("patientID","study")
+
+studylabels=list(Jansky_NB01 = "Jansky2021", Jansky_NB08 = "Jansky2021", Jansky_NB14 = "Jansky2021", 
+dong_T162 = "Dong2020", dong_T200 = "Dong2020", dong_T230 = "Dong2020", 
+Fetahu_M2 = "Fetahu2023", Fetahu_M4 = "Fetahu2023", Fetahu_M3 = "Fetahu2023", 
+Fetahu_M1 = "Fetahu2023")
+getstudy=Vectorize(function(x){
+  studylabels[[x]]
+  
+  }, USE.NAMES=F)
+
+sopts@meta.data= sopts %>% metadata %>% mutate(study= getstudy(patientID))
+
+
+################################################################################
+# mapping collectively all patient cells to our dataset
+################################################################################
+simpleCache(paste_("mappings_allpatients_to_fullncnb_proccessid", processid), {
+  
+allmapcons.allpatients=lapply(c("seurat_clusters","ccondition", "mutant.clusters" ), function(cvarr){    
+  
+  simpleCache(paste0("mapcon_allscpatients_together", cvarr, "to_fulldataset"), {
+      maplist=maptoref.pt1(query=sopts, query.assay="SCT", ref.assay="sctscvi", refdataset=sma, pdms=1:dms, mapvar=cvarr, querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE)
+       mapcon=maptoref.pt2(query=maplist$query,refdataset=maplist$ref, anchors=maplist$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar=cvarr, querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, reference.umap=ur)
+    
+    mapcon
+  }, assignToVar="mapcon", reload=fullreload, recreate=fullrecreate)
+          
+  })
+allmapcons.allpatients}, assignToVar="allmapcons.allpatients", recreate=fullrecreate, reload=fullreload) 
+      
+      ### incorporate metadata
+      for(mapcon in allmapcons.allpatients){
+       sopts=AddMetaData(sopts, mapcon)
+      }
+      
+      
+      sopts[["kamenevatype"]]=sopts %>% metadata %>% select(mapfun_fate2)
+
+
+  simpleCache(paste0("mapping_allpatients_cells_to_wt_clusters_process_", processid), {        
+  maplistwt.all=maptoref.pt1(query=sopts, query.assay="SCT", ref.assay="sctscvi", refdataset=scwt, pdms=1:dms, mapvar="WT.clusters", querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"))
+       mapconwt.all=maptoref.pt2(query=maplistwt.all$query,refdataset=maplistwt.all$ref, anchors=maplistwt.all$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar="WT.clusters", querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"), reference.umap="wtumap.fullscvi822")
+       mapconwt.all}, assignToVar="mapconwt.all", reload=fullreload)
+       
+      sopts=AddMetaData(sopts, mapconwt.all)
+```
+
+Filter to high quality mappings (judging by predicted id score) and calculating markers for high scoring cells.
+
+```{r}
+markers.var="seurat_clusters"     
+     
+ptmarkers.seurat.clusters=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=selecttop, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers 
+
+markers.var="mutant.clusters" 
+
+ptmarkers.mutant.clusters=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=NULL, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers 
+
+
+markers.var="WT.clusters" 
+simpleCache(paste_("ptmarkers_", markers.var,"process", processid), {
+ptmarkers.wt.clusters=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=250, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers
+
+}, assignToVar="ptmarkers.wt.clusters", reload=T)
+
+```
+
+WT non filtered cells, apply marker search to all the patient cells without filtering high quality mappings
+
+```{r}
+
+
+ptmarkers.wt.clusters.nonfiltered=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=0), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=250, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers
+
+
+```
+
+
+markers of cells triaged into the mutant clusters
+
+```{r}
+markers.var.full="mutant.clusters" 
+
+fulldsmarkers.mutant.clusters=seuratmarkers.delegate(sma, group_column=markers.var.full, replicate_column="orig.ident", minfc=minfc, selecttop=selecttop, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers 
+
+```
+
+
+### Analysing wild type markers,  directly from the wild type analysis, and finding those WT markers that  also appear in the patients. 
+
+```{r}
+
+markers.var="WT.clusters"
+sopts2=filterps(sopts, varbl=markers.var, th=predicted.id.thresh)
+
+cellinfo.pts.wt=seriatecells(replacemarkers(sopts2, newmarkers=get.top.markers(scwt)), clusvar=mapfun(markers.var), ass="SCT", meth="seurat", groupvarname="group1", lfcvarname=lfcvar, extended.output=T, ncells=600) 
+
+cellinfo.pts.self=seriatecells(replacemarkers(sopts2, newmarkers=ptmarkers.wt.clusters), clusvar=mapfun(markers.var), ass="SCT", meth="seurat", groupvarname="group1", lfcvarname=lfcvar, extended.output=T, ncells=600) 
+
+
+cellinfo.pts.shared=list()
+cellinfo.pts.shared$markerlist=lapply(names(cellinfo.pts.self$markerlist),function(xx) intersect(cellinfo.pts.self$markerlist[[xx]], cellinfo.pts.wt$markerlist[[xx]])) %>% givename(., names(cellinfo.pts.self$markerlist))
+cellinfo.pts.shared$cell.list=cellinfo.pts.self$cell.list
+cellinfo.pts.shared$cell.metadata=cellinfo.pts.self$cell.metadata
+cellinfo.pts.shared=refresh.cellinfo(cellinfo.pts.shared) %>% update.group.vars(., global="WT.clusters")
+
+
+cellinfo.pts2= cellinfo.pts.shared  %>% #adjust.markers(., npatient.markers.show) %>% 
+add.cell.annotation(sopts2, .,annotvars) %>% subset.cellinfo(., allcolors[[markers.var]] %>% names)
+#seriategenes(replacemarkers(sopts, newmarkers=markerchoice),.)
+
+
+gtl=adjust.markers(cellinfo.pts2, 5)$markers
+sca=1.2
+tpdf(path=params$plotpath, paste_("heatmap_patients_sharedmarkers_inlcudenonmycn_qcfilter", qcpars3$allpatients$counts), wi=pw*sca*1.5, he=pw*sca)
+hx=cellinfo.heatmap(sopts2, adjust.markers(cellinfo.pts2,40), name="test_heatmap",assay="SCT", genes.to.label=gtl, colorlist=allcolors, color.labels.by=markers.var)
+print(hx)
+dev.off()
+
+
+```
+
+
+
+### Plot heatmap of shared markers between wt cells and patient cells with final colors. 
+
+
+```{r}
+changelist=function(lst, el, new){
+ lst[[el]]=new 
+  lst
+}
+
+mixcolors= c(allcolors[["WT.clusters"]], allcolors[["WT.clusters"]] %>% givename(., names(allcolors[["WT.clusters"]]) %>% addprefix(., "pt")))
+
+lapply(cellinfo.pt2$markerlist %>% names,function(clu) {
+sca=2
+tpng(path=params$plotpath, paste_("heatmap_patients_jointmarkers_cluster",clu ), wi=w*sca*1.5, he=w*sca )
+hx=cellinfo.heatmap(sopts, adjust.markers(cellinfo.pts2,10), name="test_heatmap", genes.to.label=cellinfo.pts2$markerlist[[clu]], colorlist=changelist(allcolors, "mapfun_WT.clusters", mixcolors), color.labels.by="mapfun_WT.clusters")
+print(hx)
+dev.off()
+})
+
+cellinfo.pts4= cellinfo.pts2 %>% adjust.markers(.,40) %>% 
+  add.cell.annotation(sopts2,., annotvars)
+gtl=adjust.markers(cellinfo.pts4, 3)$markers
+sca=2
+tpng(path=params$plotpath, paste_("heatmap_patients_jointmarkers_allclusterslabeled"), wi=w*sca*1.5, he=w*sca*1.5 )
+hx=cellinfo.heatmap(sopts2, cellinfo.pts4, name="test_heatmap", genes.to.label=gtl, colorlist=changelist(allcolors, "mapfun_WT.clusters", mixcolors), color.labels.by="mapfun_WT.clusters")
+print(hx)
+dev.off()
+
+
+
+
+```
+
+
+Supplementary figure 10 b bubble plot of relative frequencies
+
+```{r}
+
+allcolors[["mapfun_WT.clusters"]]=
+c(C1 = "#9370db", C2 = "#86D36C", C3 = "#CB5CBB", C4 = "#F0C4E5", 
+C5 = "#086625", C6 = "#19FAFD", C7 = "#9FE6B2", C8 = "#C190AA", 
+C9 = "#9E9C79", C10 = "#d2691e", C11 = "#deb887", C12 = "#92A0CD", 
+C13 = "#55B384", C14 = "#CD0252")
+allcolors[["WT.clusters"]]=
+c(C1 = "#9370db", C2 = "#86D36C", C3 = "#CB5CBB", C4 = "#F0C4E5", 
+C5 = "#086625", C6 = "#19FAFD", C7 = "#9FE6B2", C8 = "#C190AA", 
+C9 = "#9E9C79", C10 = "#d2691e", C11 = "#deb887", C12 = "#92A0CD", 
+C13 = "#55B384", C14 = "#CD0252")
+
+relfreqs=sopts %>% metadata %>% group_split(patientID) %>% lapply(., function(x) x %>% mutate(reltot= nrow(x)) %>% group_by(patientID, mapfun_WT.clusters) %>% summarise(counts=n()) %>% ungroup() %>% mutate(relfreq=counts/sum(counts)) ) %>% Reduce(rbind, .)
+
+bp=ggplot(relfreqs)+geom_point(aes(x=patientID, y=factor(mapfun_WT.clusters, levels=allcolors[["mapfun_WT.clusters"]] %>% names), size=relfreq, color=mapfun_WT.clusters))+scale_color_manual(values=allcolors[["mapfun_WT.clusters"]])+theme_classic()+rotatex(90)+ylab("Relative fraction")+xlab("Patient")+theme(legend.position="bottom")
+sca=1
+tpdf(path=params$outpath, "bubbleplot_relfrequencies_WT.clusters_patients", he=pw*sca*.9, wi=pw*sca*.8)
+print(bp)
+dev.off()
+
+```
+
+
+Block for inferCNV plotting. Figures 7 b and 11 a
+```{r}
+allcolors[["chromosome"]]=c("#515051", "#939393", "#D8D8D8")[rep(1:3, 8)[1:22]] %>% namenums(., prefix="chr") 
+allcolors[["chromosome"]]['chr1']=allcolors[["ccondition"]]["c17q1q"]
+allcolors[["chromosome"]]['chr17']=allcolors[["ccondition"]]["c17q"]
+
+sopts=AddMetaData(sopts, metadata=join_meta_exp(so=sopts, genes=c("MYCN", "TH", "GAP43"), assay="SCT")) 
+    
+    position_file <- file.path(params$downloadedfilepath, 'gene_ordering_file_gencode_v19.txt')
+    if (!file.exists(position_file)) {
+      download.file(url = 'https://data.broadinstitute.org/Trinity/CTAT/cnv/gencode_v19_gene_pos.txt', 
+                    destfile = position_file)  
+    }      
+    
+    positions=fread(position_file)   %>% as.data.frame
+    
+lapply(selids, function(pt){    
+msg("patient", pt)
+cells=sopts %>% metadata %>% filter(patientID==pt) %>% names2col(., "cellid") %>% group_by(factor(mapfun_WT.clusters, levels=allcolors[["WT.clusters"]] %>% names)) %>% arrange(-MYCN, .by_group=T) %>% ungroup() %>% pull(cellid) 
+dt=getcnvtable3(pt)[cells, ]
+
+################################################################################
+# gene levels annotations
+################################################################################
+getlevels=function(x) metadata(sopts)[cells, ] %>% pull(!!sym(x))
+
+
+hal= ComplexHeatmap::rowAnnotation(
+      WT.clusters=getlevels("mapfun_WT.clusters"),
+      
+      MYCN = ComplexHeatmap::anno_lines(getlevels("MYCN"), which="row", gp=grid::gpar(col="magenta", fill="red"), axis_param = list(direction = "reverse")),
+      col=list(
+        MYCN="red",
+        WT.clusters=allcolors[["WT.clusters"]] %>% unlist,
+
+        leiden.cluster=allcolors[["seurat_clusters"]],
+        megacluster=allcolors[["mapfun_megaclusters"]] ,
+        adrenalgland=allcolors[["kamenevatype"]]
+        
+      )
+    )
+    
+
+getchr= function(x) (positions %>% filter(V1==x))[1,"V2" ]
+    
+    msg("preparing chromosome annotation...")
+    chrs=lapply(dt %>% colnames, getchr) %>% Reduce(c, .) 
+    colanno= chrs  %>% as.data.frame(., row.names=dt %>% colnames) 
+    colnames(colanno)="chromosome"
+    colanno= colanno %>% mutate(chromosome=factor(chromosome, levels= addprefix(1:22, prefix="chr"))) 
+    filterchrs=F
+    if(!filterchrs){
+      allchrs= unique(chrs)
+      
+    }else{
+      allchrs=c("chr2", "chr17")
+    }
+    colanno= colanno %>% filter(chromosome %in% allchrs)
+    
+    
+    dt=dt[, rownames(colanno)]
+
+    pha= ComplexHeatmap::pheatmap( dt , 
+                                   scale="col",
+                                   annotation_col=colanno, 
+                                   annotation_colors=allcolors,
+                                   cluster_row=F, 
+                                   cluster_col=F,
+                                   show_colnames=F,
+                                   border_color=NA,
+                                   use_raster=T,
+                                   show_rownames=F, 
+                                   breaks=br,
+                                   color=colls,
+                                   left_annotation=hal, 
+                                   legend=T
+                                   
+                                   
+                                   
+    )
+  
+        sca=1
+    rr=600;
+    msg("dumping heatmap to figure...")
+    tpdf(path=params$plotpath, paste_("pheatmapcol4simple", "_patient", pt, "mappingfilter", th, "readsfilter", qcpars3$allpatients$counts), width=pw*1.25*sca, height=pw*.9*sca)#), res=rr)
+    print(pha)
+    dev.off()
+    
+})
+
+
+
+```
+
+
+## Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```
+
+=======
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: 06_WT_projecting_patients' cells_onto_wildtype"
+author: "Luis Montano"
+date: '2023-08-07'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+  outpath: '~/mnt_out/figures/'
+  resourcepath: "~/mnt_resources/"
+  infercnvpath: '~/path/to/input_data/infercnv/'
+  gtfpath: '~/path/to/gencode.v40.annotation.gtf.gz'
+  downloadedfilepath: '~/path/to/downloaded_files/'
+  fig_width: 6
+  fig_height: 4
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load functions and relevant variables, and prepare workspace
+
+```{r}
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+vfeatures=5000
+pcdims=30
+umapdims=10
+sz=.02
+tsca=200
+
+################################################################################
+# setting UMAP parameters
+################################################################################
+  wtumapdims=10
+  wtnn=30
+  wtag="WT"
+  wtmd=0.4
+  pval=0.05
+  padj=pval
+  minfc=.3
+  fdr=0.05
+  selecttop=250
+  ncells.show=200
+  method.markers="deseq"
+  method.seriate="seurat"
+  clusvarname=""
+################################################################################
+#### comparison heatmap parameters
+################################################################################  
+  numcells=100
+
+################################################################################
+# recreation/ reloading controls
+################################################################################  
+loadcontrols=list()
+  loadcontrols$wtmarkers=list(
+ loadfulldata="reload",
+ processraw="reload",
+ calculateclusters="recreate"
+  )
+################################################################################
+#glasswork plot parameters
+################################################################################
+gwvarr="stage"
+
+  sca=10
+  rr=600
+  ssca=200
+  varrlab=gwvarr
+  sca=10
+  rr=600
+  ssca=180
+  hullpointsize=0.05
+  linesize=0.1
+  fillvar="clusterfrac"
+
+plotmeth="jitter"
+
+################################################################################
+# mapped cell analysis
+################################################################################
+
+nmappedcells.show=500
+
+################################################################################
+#
+################################################################################
+lfcvar="log_fc"
+
+################################################################################
+# specific functions
+################################################################################
+
+getmegacluster= Vectorize(function(x){
+  l=lapply(names(clustergroups), function(nm)
+    if(x %in% clustergroups[[nm]]){nm}) %>% Reduce(c, .) 
+  l[[!is.null(l)]]}, USE.NAMES=F)
+
+min.counts=500
+max.mito=20
+qcpars3=list(
+  NB08=list(counts=100, features=0, mito=40, clustersremove=NULL),
+  NB02=list(counts=0, features=0, mito=100, clustersremove=NULL),
+  default=list(counts=500, features=0, mito=40, clustersremove=NULL),
+   allpatients=list(counts = min.counts, features = 0, mito = max.mito, clustersremove = NULL)
+
+)
+
+filterds=function(so){
+  nm=Project(so)
+  if(nm %in% names(qcpars3)){
+    so[, so %>% metadata %>% filter(nCount_RNA>=qcpars3[[nm]]$counts, nFeature_RNA>=qcpars3[[nm]]$features, percent.mt<=qcpars3[[nm]]$mito ) %>% rownames] 
+  }else{
+    so[, so %>% metadata %>% filter(nCount_RNA>=qcpars3[["default"]]$counts, nFeature_RNA>=qcpars3[["default"]]$features, percent.mt<=qcpars3[["default"]]$mito ) %>% rownames] 
+    
+  }
+}
+
+
+getcnvtable3= function(pt){
+  if(pt %in%  (gpmeta  %>% pull(patientID) %>% unique)){
+    msg("group_patient")
+    return(readRDS(paste0(params$infercnvpath, "_anonymised/220913_patient_", pt, "/infercnv.observations.Rds")))
+  }
+}
+
+
+getcounts= function(pt){
+  if(pt %in%  (gpmeta  %>% pull(patientID) %>% unique)){
+    msg("group_patient")
+    return(gpcounts[, gpmeta %>% filter(patientID==pt) %>% rownames])
+  }else{
+    if(pt %in%  (olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% pull(patientID) %>% unique)){
+      msg("olsen patient")
+      return(olsencounts[, olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% filter(patientID==pt) %>% rownames])                               
+    }
+    
+  }
+}
+
+
+getmeta= function(pt){
+  if(pt %in%  (gpmeta  %>% pull(patientID) %>% unique)){
+    msg("group_patient")
+    return(gpmeta[gpmeta %>% filter(patientID==pt) %>% rownames, ])
+  }else{
+    if(pt %in%  (olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% pull(patientID) %>% unique)){
+      msg("olsen patient")
+      return(olsenmeta[ olsenmeta %>% mutate(patientID= paste_("olsen", patientID)) %>% filter(patientID==pt) %>% rownames, ])                                 #  strsplit(pt, split="_")[[1]][2]]])
+    }
+    
+  }
+}
+
+getpt=function(so) so %>% metadata %>% pull(patientID) %>% unique 
+
+
+################################################################################
+# rectifying relevant colors
+################################################################################
+
+allcolors[["study"]]=c( Fetahu2023='#8da0cb',Dong2020='#e78ac3',Jansky2021='#a6d854')
+```
+
+
+Install specific python libraries
+
+```{bash}
+conda 
+pip install leidenalg
+pip install pandas
+```
+
+## Load full, processed dataset
+
+```{r}
+#load integrated single cell experiment wih data across all datasets
+
+fullrecreate=F; fullreload=T
+simpleCache("fulldataset_with_clusters", {sma}, assignToVar="sma", reload=T)
+
+```
+
+## importing wt dataset
+
+```{r loadwt}
+
+simpleCache("seurat_WT_processed_clusters_markers", {scwt}, 
+            reload=T,
+            assignToVar="scwt")
+
+```
+
+
+##  UMAPs of neuroblastoma diagnostic markers
+
+```{r}
+
+################################################################################
+
+# Figure 5b. UMAPS of neuroblastoma diagnostic markers.
+
+################################################################################
+
+
+nbmarkers=c("NCAM1", "L1CAM", "B4GALNT1", "SYP", "TH", "DDC", "CHRNA3", "GAP43", "DBH", "PROM1","YAP1", "WWTR1")
+
+sca=10
+lapply(nbmarkers, function(x){
+  tpng(path=params$plotpath, paste0("UMAPncnb_nbmarkers_wlegend", x), res=600, he=w*sca, wi=w*sca)
+  print(FeaturePlot(sma, reduction=ur, features=x, cols=c("#EEEEEE33","blue"))+NoAxes())
+  dev.off()
+})
+
+
+################################################################################
+
+# calculating marker specificity
+
+################################################################################
+
+marktable=join_meta_exp(sma, genes=nbmarkers) %>% pivot_longer(., cols=nbmarkers, names_to="gene", values_to="expression")
+
+summar=marktable %>% mutate(isexp=expression>0) %>% group_by(seurat_clusters, gene) %>% summarise(counts=n(), pct.exp=sum(isexp)/counts) %>% as.data.frame
+specificity.ranks=summar %>% group_by(gene) %>% summarise(sum_of_percents= sum(pct.exp), specificity=1/sum_of_percents) %>% arrange(-specificity)
+
+sca=6
+tpng("specificity_score", wi=w*sca, he=w*1.5*sca, res=600)
+ggplot(specificity.ranks, 
+       aes(x=factor(gene, levels=specificity.ranks %>% pull(gene)), y=specificity))+geom_col()+coord_flip()+theme_classic()
+dev.off()
+
+marktable=join_meta_exp(sma, genes=nbmarkers) %>% pivot_longer(., cols=nbmarkers, names_to="gene", values_to="expression")
+
+summar=marktable %>% mutate(isexp=expression>0) %>% group_by(seurat_clusters, gene) %>% summarise(counts=n(), pct.exp=sum(isexp)/counts, mnexp=mean(expression)) %>% as.data.frame
+specificity.ranks=summar %>% group_by(gene) %>% summarise(sum_of_percents= sum(pct.exp), specificity=1/sum_of_percents) %>% arrange(-specificity)
+
+sca=6
+tpng("specificity_stack", wi=w*sca, he=w*1.5*sca, res=600)
+ggplot(summar, 
+       aes(x=factor(gene, levels=specificity.ranks %>% pull(gene)), y=mnexp))+geom_col(position="stack", aes(fill=seurat_clusters))+coord_flip()+theme_classic()+NoLegend()
+dev.off()
+
+
+summars=lapply(nbmarkers, function(x){
+  summar %>% filter(gene==x) %>% arrange(-pct.exp) }
+)
+
+```
+
+### Import pre-assembled single cell data from patients
+
+```{r}
+
+####PATIENT CODES HAVE BEEN ANONYMISED. 
+
+gpmeta=readRDS(paste0(params$inputdata,"ptdatasetsmeta_noqc_anonymised.rds")     )
+gpcounts= readRDS(paste0(params$inputdata,"ptdatasetscounts_anonymised.rds" )  )
+
+```
+
+Provide a human readable name for full dataset clusters called megaclusters. 
+
+```{r}
+
+#removing patients that just have few mycn+ cells
+
+
+clusvarname="seurat_clusters"
+selids=c("Jansky_NB01", "Jansky_NB08", 
+  "Jansky_NB14",
+  "dong_T162", "dong_T200", "dong_T230", 
+  "Fetahu_M2", "Fetahu_M4",
+         "Fetahu_M3", "Fetahu_M1")
+
+allcolors[["patientID"]]=c(Jansky_NB01 = "#9E9C79", Jansky_NB08 = "#F4BE67", Jansky_NB14 = "#92A0CD", 
+dong_T162 = "#55B384", dong_T200 = "#CD0252", dong_T230 = "#6D22B0", 
+Fetahu_M2 = "#8B1750", Fetahu_M4 = "#16EA6E", Fetahu_M3 = "#38724F", 
+Fetahu_M1 = "#231F0B")
+
+
+recreate=F
+rld=T
+cellfilter=3
+ass="RNA"
+allcolors[["mapfun_ccondition"]]=allcolors[["ccondition"]]
+dms=50; re=0.05
+
+plotumaps=F
+plotheatmap=T
+calculatemarkers=T
+makehullplots=F
+
+allcolors[["null"]]=c(one="#FFFFFF00")
+arg=14
+
+################################################################################
+# find cluster correspondences between  clusters and "M" megaclusters
+################################################################################
+
+clustersummary=sma %>% metadata %>% group_by(mutant.clusters, !!sym(clusvarname)) %>% summarise(counts=n()) %>% as.data.frame
+
+megaclus= allcolors[[finalclusvar]] %>% names
+
+clustergroups0=lapply(megaclus, function(x){
+  clustersummary %>% filter(!!sym(finalclusvar)==x) %>% pull(!!sym(clusvarname)) %>% as.character
+  })
+
+### abstracted megacluster labels 
+megacluslabels=c(one="STEMCELLS", two="NMP", three="NC", four="NC_UNDIF", five="MYCN_EARLY", six="SENSORY_CNA", seven="MYCN_MID", eight="SENSORY", nine="MES_UNDIF", ten="SCP_CNA", eleven="MYCN_SCP", twelve="MYCN_LATE", thirteen="SYM", fourteen="MES_SYM", fifteen="MES", sixteen="MES_CNA")
+
+names(clustergroups0)=megacluslabels
+
+## from the above we dput and adjust. moved cluster 30 to MES_SYM
+
+clustergroups=list(STEMCELLS = c("11", "13", "14", "27", "28", "29", "39"), 
+    NMP = c("1", "35", "37"), NC = c("0", "34"), NC_UNDIF = c("10", 
+    "18"), MYCN_EARLY = c("20", "33"), SENSORY_CNA = c("2", "26", 
+    "32"), MYCN_MID = "5", SENSORY = c("8", "24"), MES_UNDIF = c("12", 
+    "15", "38"), SCP = c("3", "9", "25", "36"), MYCN_SCP = "21", 
+    MYCN_LATE = c("19", "22"), SYM = c("4", "31"), MES_SYM = c("30","17"), 
+    MES = c("6", "7", "16"), MES_CNA = "23")
+
+megalevels=c("STEMCELLS", "NMP", "NC", "NC_UNDIF", "MYCN_EARLY", "SENSORY_CNA", 
+"MYCN_MID", "SENSORY", "MES_UNDIF", "SCP", "MYCN_SCP", "MYCN_LATE", 
+"SYM", "MES_SYM", "MES", "MES_CNA")
+
+
+sma@meta.data=sma %>% metadata %>% mutate(megaclusters=getmegacluster(!!sym(clusvarname)))
+
+th=0.6
+
+
+allcolors[["megaclusters"]]= randomcolors(length(megalevels)) %>% givename(., megalevels)
+allcolors[["mapfun_megaclusters"]]= randomcolors(length(megalevels)) %>% givename(., megalevels)
+
+allclusters=allcolors[["WT.clusters"]] %>% names
+clusorder=allclusters
+allcolors[["seurat_clusters"]]= randomcolors(length(allclusters)) %>% givename(., allclusters)
+allcolors[["mapfun_seurat_clusters"]]= randomcolors(length(allclusters)) %>% givename(., allclusters)
+
+```
+
+```{r}
+simpleCache("seurat_ncnb_full_w_megaclusters", {sma}, assignToVar="sma", reload=T)
+```
+
+
+## looping through patients to assemble CNV plots.
+
+
+
+```{r patientcnvgoodloop}
+ if (!exists("gpmeta")) {
+   gpmeta=readRDS(paste0(params$inputdata, "ptdatasetsmeta_noqc_anonymised.rds")     )
+  } 
+ if (!exists("gpcounts")) {
+gpcounts= readRDS(paste0(params$inputdata,"ptdatasetscounts_anonymised.rds")   )
+}
+
+     varr="WT.clusters"
+groupvar="mapfun_WT.clusters"
+ass="SCT"
+recreate=F
+rld=T
+filteroverview=list(beforefilter=list(), afterfilter=list() )
+
+finalcells=list()
+finalmetadata=list()
+
+
+#processing and plotting patient dataset
+
+allplots=lapply(selids, function(ptid){
+  gc()
+  maplist=NULL
+  #require(Azimuth)
+  currentptid<<-ptid
+  fcat("patient ", ptid)
+
+  pt1cells=getmeta(ptid) %>% rownames
+  
+  
+  if(recreate==T || rld==T){
+    simpleCache(paste_("patientseurat", ptid, "cellfilter", cellfilter),{
+      p1=CreateSeuratObject(counts=(getcounts(ptid) %>% as.matrix)[, pt1cells], meta.data= getmeta(ptid) %>% as.data.frame, project=ptid)
+      qcplots(p1, plotname=paste0("qcplots_", ptid), plotsize=200)
+      
+      if(cellfilter==1){   
+        selectedcells=join_meta_exp(p1, genes=c("MYCN", "PTPRC", "CD34", "KDR"), assay="RNA") %>% filter(PTPRC==0, CD34==0, KDR==0) %>% rownames
+        p1=p1[, selectedcells]
+      }
+      if(cellfilter==2){
+        selectedcells=join_meta_exp(p1, genes=c("MYCN", "PTPRC", "CD34"), assay="RNA") %>% filter(PTPRC==0) %>% rownames
+        p1=p1[, selectedcells]
+      }
+      if(cellfilter==3){                                          
+        msg("removing cells with extraneous markers...")
+        #liver  #cortex                     #kidney          #erythroid
+        allcellstab=join_meta_exp(p1, genes=c("MYCN", "PTPRC", "CD34", "AHSG", "STAR", "NR5A1", "KDR", "CYP17A1", "PAX2", "LYPD1", "HBA2"), assay="RNA") 
+        #do not discriminate against kdr positive cells just in case
+        selectedcells=allcellstab %>% filter(PTPRC==0, CD34==0, MYCN>0, AHSG==0, LYPD1==0, HBA2==0, NR5A1==0)%>% rownames
+        filteroverview$beforefilter[[ptid]]<<-nrow(allcellstab)
+        
+        p1=p1[, selectedcells]
+      }
+      
+      p1<<-filterds(p1) #keeping this on the main workspace
+      filteroverview$afterfilter[[ptid]]<<-p1 %>% metadata %>% nrow
+      if (filteroverview$afterfilter[[ptid]]<25){
+        msg("patient has", length(selectedcells), "after filtering. skipping" )
+        next
+      }
+      #})
+      
+      
+      p1=SCTransform(p1, method="glmGamPoi", variable.features.n=6000)
+      p1=NormalizeData(p1, assay="RNA")
+      DefaultAssay(p1)="RNA"
+      p1=ScaleData(p1)
+      
+      p1=FindVariableFeatures(p1, assay="RNA",nfeatures=5000)
+      
+
+      
+      DefaultAssay(p1)=ass
+      
+      
+
+      p1=RunPCA(p1, assay=ass)
+      p1=RunUMAP(p1, dims=1:dms)
+            p1=FindNeighbors(p1, reduction="umap", dims=c(1,2))
+      p1=FindClusters(p1, res=re)
+      ###renaming the assay if it is called RNA
+      
+      p1=RenameAssays(p1, SCT="refAssay")
+      #########
+      #mapping the patient to the new resolution clusters
+      #########
+      
+  allmapcons=lapply(c("seurat_clusters","ccondition", "mutant.clusters" ), function(cvarr){    
+  
+      maplist=maptoref.pt1(query=p1, ref.assay="sctscvi", refdataset=sma, pdms=1:dms, mapvar=cvarr, querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"))
+       mapcon=maptoref.pt2(query=maplist$query,refdataset=maplist$ref, anchors=maplist$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar=cvarr, querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"), reference.umap=ur)
+    
+    mapcon 
+          
+  })
+      
+
+      ### incorporate metadata
+      for(mapcon in allmapcons){
+        p1=AddMetaData(p1, mapcon)
+      }
+      
+
+      msg("Adding megacluster metadata")
+      p1[["mapfun_megaclusters"]]=lapply( p1 %>% metadata %>% pull(mapfun("seurat_clusters")), function(x) getmetacluster(x)) %>% Reduce(c,.)
+      
+      p1[["kamenevatype"]]=p1 %>% metadata %>% select(mapfun_fate2)
+      p1
+    },  assignToVar="p1", recreate=recreate, reload=rld)
+    
+    
+  }else{    
+    simpleCache(paste_("patientseurat", ptid, "cellfilter", cellfilter), assignToVar="p1", reload=T)
+    
+  }
+
+  
+  simpleCache(paste0("mapping_patient_cells_to_wt_clusters_", ptid), {        
+  maplistwt=maptoref.pt1(query=p1, ref.assay="sctscvi", refdataset=scwt, pdms=1:dms, mapvar="WT.clusters", querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"))
+       mapconwt=maptoref.pt2(query=maplistwt$query,refdataset=maplistwt$ref, anchors=maplistwt$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar="WT.clusters", querylabel=ptid, reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"), reference.umap="wtumap.fullscvi822")
+       mapconwt}, assignToVar="mapconwt", reload=rld)
+       
+      p1=AddMetaData(p1, mapconwt)
+  
+  finalcells[[ptid]]<<-colnames(p1)
+  finalmetadata[[ptid]]<<-p1 %>% metadata
+  currentp1<<-p1
+  
+
+  p1=filterps(p1, varbl=varr, th=th)
+  
+
+  
+  
+  
+  
+})
+
+
+
+
+```
+
+
+Mapping Patients' cells to WT reference, all together. 
+
+```{r}
+processid="01-20231123"
+
+fullrecreate=F
+fullreload=T
+salience=T
+get.salience=function(x) x %>% mutate(salience=rate1/rate2)
+sort.by.salience= function(x, gvar) x %>% get.salience %>% group_by(!!sym(gvar)) %>% arrange(-salience, .by_group=T) %>% ungroup %>% as.data.frame
+
+npatient.markers.show=15
+predicted.id.thresh=0.6
+
+
+simpleCache(paste_("seurat_allpatients_mincounts", min.counts, "minmito", max.mito, "nohsc", "id", processid), {
+sopts= CreateSeuratObject(counts=gpcounts, meta.data=gpmeta)
+
+sopts=AddMetaData(sopts, metadata=join_meta_exp(so=sopts, genes=c("MYCN", "TH", "GAP43"), assay="RNA"))
+
+## filter out all possible immune cells
+sopts=sopts[, sopts %>% metadata %>% filter(kamenevatype!="HSC_and_immune") %>% rownames]
+Project(sopts)="allpatients"
+sopts= SCTransform(filterds(sopts), method="glmGamPoi", variable.features.n=5000)
+
+ sopts=RunPCA(sopts)
+ sopts=FindNeighbors(sopts)
+ sopts=FindClusters(sopts)
+ sopts
+}, assignToVar="sopts", recreate=fullrecreate, reload=fullreload)
+
+ annotvars=c("patientID","study")
+
+studylabels=list(Jansky_NB01 = "Jansky2021", Jansky_NB08 = "Jansky2021", Jansky_NB14 = "Jansky2021", 
+dong_T162 = "Dong2020", dong_T200 = "Dong2020", dong_T230 = "Dong2020", 
+Fetahu_M2 = "Fetahu2023", Fetahu_M4 = "Fetahu2023", Fetahu_M3 = "Fetahu2023", 
+Fetahu_M1 = "Fetahu2023")
+getstudy=Vectorize(function(x){
+  studylabels[[x]]
+  
+  }, USE.NAMES=F)
+
+sopts@meta.data= sopts %>% metadata %>% mutate(study= getstudy(patientID))
+
+
+################################################################################
+# mapping collectively all patient cells to our dataset
+################################################################################
+simpleCache(paste_("mappings_allpatients_to_fullncnb_proccessid", processid), {
+  
+allmapcons.allpatients=lapply(c("seurat_clusters","ccondition", "mutant.clusters" ), function(cvarr){    
+  
+  simpleCache(paste0("mapcon_allscpatients_together", cvarr, "to_fulldataset"), {
+      maplist=maptoref.pt1(query=sopts, query.assay="SCT", ref.assay="sctscvi", refdataset=sma, pdms=1:dms, mapvar=cvarr, querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE)
+       mapcon=maptoref.pt2(query=maplist$query,refdataset=maplist$ref, anchors=maplist$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar=cvarr, querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, reference.umap=ur)
+    
+    mapcon
+  }, assignToVar="mapcon", reload=fullreload, recreate=fullrecreate)
+          
+  })
+allmapcons.allpatients}, assignToVar="allmapcons.allpatients", recreate=fullrecreate, reload=fullreload) 
+      
+      ### incorporate metadata
+      for(mapcon in allmapcons.allpatients){
+       sopts=AddMetaData(sopts, mapcon)
+      }
+      
+      
+      sopts[["kamenevatype"]]=sopts %>% metadata %>% select(mapfun_fate2)
+
+
+  simpleCache(paste0("mapping_allpatients_cells_to_wt_clusters_process_", processid), {        
+  maplistwt.all=maptoref.pt1(query=sopts, query.assay="SCT", ref.assay="sctscvi", refdataset=scwt, pdms=1:dms, mapvar="WT.clusters", querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"))
+       mapconwt.all=maptoref.pt2(query=maplistwt.all$query,refdataset=maplistwt.all$ref, anchors=maplistwt.all$anchors, ref.assay="sctscvi", pdms=1:dms, mapvar="WT.clusters", querylabel="patients", reflabel="invitro", return.merge.metadata=F, return.query.metadata=TRUE, customcol=c("seurat_clusters"), reference.umap="wtumap.fullscvi822")
+       mapconwt.all}, assignToVar="mapconwt.all", reload=fullreload)
+       
+      sopts=AddMetaData(sopts, mapconwt.all)
+```
+
+Filter to high quality mappings (judging by predicted id score) and calculating markers for high scoring cells.
+
+```{r}
+markers.var="seurat_clusters"     
+     
+ptmarkers.seurat.clusters=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=selecttop, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers 
+
+markers.var="mutant.clusters" 
+
+ptmarkers.mutant.clusters=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=NULL, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers 
+
+
+markers.var="WT.clusters" 
+simpleCache(paste_("ptmarkers_", markers.var,"process", processid), {
+ptmarkers.wt.clusters=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=250, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers
+
+}, assignToVar="ptmarkers.wt.clusters", reload=T)
+
+```
+
+WT non filtered cells, apply marker search to all the patient cells without filtering high quality mappings
+
+```{r}
+
+
+ptmarkers.wt.clusters.nonfiltered=seuratmarkers.delegate(filterps(sopts, varbl=markers.var, th=0), group_column=mapfun(markers.var), replicate_column="patientID", minfc=minfc, selecttop=250, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers
+
+
+```
+
+
+markers of cells triaged into the mutant clusters
+
+```{r}
+markers.var.full="mutant.clusters" 
+
+fulldsmarkers.mutant.clusters=seuratmarkers.delegate(sma, group_column=markers.var.full, replicate_column="orig.ident", minfc=minfc, selecttop=selecttop, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5)$RNA@misc$top_markers 
+
+```
+
+
+### Analysing wild type markers,  directly from the wild type analysis, and finding those WT markers that  also appear in the patients. 
+
+```{r}
+
+markers.var="WT.clusters"
+sopts2=filterps(sopts, varbl=markers.var, th=predicted.id.thresh)
+
+cellinfo.pts.wt=seriatecells(replacemarkers(sopts2, newmarkers=get.top.markers(scwt)), clusvar=mapfun(markers.var), ass="SCT", meth="seurat", groupvarname="group1", lfcvarname=lfcvar, extended.output=T, ncells=600) 
+
+cellinfo.pts.self=seriatecells(replacemarkers(sopts2, newmarkers=ptmarkers.wt.clusters), clusvar=mapfun(markers.var), ass="SCT", meth="seurat", groupvarname="group1", lfcvarname=lfcvar, extended.output=T, ncells=600) 
+
+
+cellinfo.pts.shared=list()
+cellinfo.pts.shared$markerlist=lapply(names(cellinfo.pts.self$markerlist),function(xx) intersect(cellinfo.pts.self$markerlist[[xx]], cellinfo.pts.wt$markerlist[[xx]])) %>% givename(., names(cellinfo.pts.self$markerlist))
+cellinfo.pts.shared$cell.list=cellinfo.pts.self$cell.list
+cellinfo.pts.shared$cell.metadata=cellinfo.pts.self$cell.metadata
+cellinfo.pts.shared=refresh.cellinfo(cellinfo.pts.shared) %>% update.group.vars(., global="WT.clusters")
+
+
+cellinfo.pts2= cellinfo.pts.shared  %>% #adjust.markers(., npatient.markers.show) %>% 
+add.cell.annotation(sopts2, .,annotvars) %>% subset.cellinfo(., allcolors[[markers.var]] %>% names)
+#seriategenes(replacemarkers(sopts, newmarkers=markerchoice),.)
+
+
+gtl=adjust.markers(cellinfo.pts2, 5)$markers
+sca=1.2
+tpdf(path=params$plotpath, paste_("heatmap_patients_sharedmarkers_inlcudenonmycn_qcfilter", qcpars3$allpatients$counts), wi=pw*sca*1.5, he=pw*sca)
+hx=cellinfo.heatmap(sopts2, adjust.markers(cellinfo.pts2,40), name="test_heatmap",assay="SCT", genes.to.label=gtl, colorlist=allcolors, color.labels.by=markers.var)
+print(hx)
+dev.off()
+
+
+```
+
+
+
+### Plot heatmap of shared markers between wt cells and patient cells with final colors. 
+
+
+```{r}
+changelist=function(lst, el, new){
+ lst[[el]]=new 
+  lst
+}
+
+mixcolors= c(allcolors[["WT.clusters"]], allcolors[["WT.clusters"]] %>% givename(., names(allcolors[["WT.clusters"]]) %>% addprefix(., "pt")))
+
+lapply(cellinfo.pt2$markerlist %>% names,function(clu) {
+sca=2
+tpng(path=params$plotpath, paste_("heatmap_patients_jointmarkers_cluster",clu ), wi=w*sca*1.5, he=w*sca )
+hx=cellinfo.heatmap(sopts, adjust.markers(cellinfo.pts2,10), name="test_heatmap", genes.to.label=cellinfo.pts2$markerlist[[clu]], colorlist=changelist(allcolors, "mapfun_WT.clusters", mixcolors), color.labels.by="mapfun_WT.clusters")
+print(hx)
+dev.off()
+})
+
+cellinfo.pts4= cellinfo.pts2 %>% adjust.markers(.,40) %>% 
+  add.cell.annotation(sopts2,., annotvars)
+gtl=adjust.markers(cellinfo.pts4, 3)$markers
+sca=2
+tpng(path=params$plotpath, paste_("heatmap_patients_jointmarkers_allclusterslabeled"), wi=w*sca*1.5, he=w*sca*1.5 )
+hx=cellinfo.heatmap(sopts2, cellinfo.pts4, name="test_heatmap", genes.to.label=gtl, colorlist=changelist(allcolors, "mapfun_WT.clusters", mixcolors), color.labels.by="mapfun_WT.clusters")
+print(hx)
+dev.off()
+
+
+
+
+```
+
+
+Supplementary figure 10 b bubble plot of relative frequencies
+
+```{r}
+
+allcolors[["mapfun_WT.clusters"]]=
+c(C1 = "#9370db", C2 = "#86D36C", C3 = "#CB5CBB", C4 = "#F0C4E5", 
+C5 = "#086625", C6 = "#19FAFD", C7 = "#9FE6B2", C8 = "#C190AA", 
+C9 = "#9E9C79", C10 = "#d2691e", C11 = "#deb887", C12 = "#92A0CD", 
+C13 = "#55B384", C14 = "#CD0252")
+allcolors[["WT.clusters"]]=
+c(C1 = "#9370db", C2 = "#86D36C", C3 = "#CB5CBB", C4 = "#F0C4E5", 
+C5 = "#086625", C6 = "#19FAFD", C7 = "#9FE6B2", C8 = "#C190AA", 
+C9 = "#9E9C79", C10 = "#d2691e", C11 = "#deb887", C12 = "#92A0CD", 
+C13 = "#55B384", C14 = "#CD0252")
+
+relfreqs=sopts %>% metadata %>% group_split(patientID) %>% lapply(., function(x) x %>% mutate(reltot= nrow(x)) %>% group_by(patientID, mapfun_WT.clusters) %>% summarise(counts=n()) %>% ungroup() %>% mutate(relfreq=counts/sum(counts)) ) %>% Reduce(rbind, .)
+
+bp=ggplot(relfreqs)+geom_point(aes(x=patientID, y=factor(mapfun_WT.clusters, levels=allcolors[["mapfun_WT.clusters"]] %>% names), size=relfreq, color=mapfun_WT.clusters))+scale_color_manual(values=allcolors[["mapfun_WT.clusters"]])+theme_classic()+rotatex(90)+ylab("Relative fraction")+xlab("Patient")+theme(legend.position="bottom")
+sca=1
+tpdf(path=params$outpath, "bubbleplot_relfrequencies_WT.clusters_patients", he=pw*sca*.9, wi=pw*sca*.8)
+print(bp)
+dev.off()
+
+```
+
+
+Block for inferCNV plotting. Figures 7 b and 11 a
+```{r}
+allcolors[["chromosome"]]=c("#515051", "#939393", "#D8D8D8")[rep(1:3, 8)[1:22]] %>% namenums(., prefix="chr") 
+allcolors[["chromosome"]]['chr1']=allcolors[["ccondition"]]["c17q1q"]
+allcolors[["chromosome"]]['chr17']=allcolors[["ccondition"]]["c17q"]
+
+sopts=AddMetaData(sopts, metadata=join_meta_exp(so=sopts, genes=c("MYCN", "TH", "GAP43"), assay="SCT")) 
+    
+    position_file <- file.path(params$downloadedfilepath, 'gene_ordering_file_gencode_v19.txt')
+    if (!file.exists(position_file)) {
+      download.file(url = 'https://data.broadinstitute.org/Trinity/CTAT/cnv/gencode_v19_gene_pos.txt', 
+                    destfile = position_file)  
+    }      
+    
+    positions=fread(position_file)   %>% as.data.frame
+    
+lapply(selids, function(pt){    
+msg("patient", pt)
+cells=sopts %>% metadata %>% filter(patientID==pt) %>% names2col(., "cellid") %>% group_by(factor(mapfun_WT.clusters, levels=allcolors[["WT.clusters"]] %>% names)) %>% arrange(-MYCN, .by_group=T) %>% ungroup() %>% pull(cellid) 
+dt=getcnvtable3(pt)[cells, ]
+
+################################################################################
+# gene levels annotations
+################################################################################
+getlevels=function(x) metadata(sopts)[cells, ] %>% pull(!!sym(x))
+
+
+hal= ComplexHeatmap::rowAnnotation(
+      WT.clusters=getlevels("mapfun_WT.clusters"),
+      
+      MYCN = ComplexHeatmap::anno_lines(getlevels("MYCN"), which="row", gp=grid::gpar(col="magenta", fill="red"), axis_param = list(direction = "reverse")),
+      col=list(
+        MYCN="red",
+        WT.clusters=allcolors[["WT.clusters"]] %>% unlist,
+
+        leiden.cluster=allcolors[["seurat_clusters"]],
+        megacluster=allcolors[["mapfun_megaclusters"]] ,
+        adrenalgland=allcolors[["kamenevatype"]]
+        
+      )
+    )
+    
+
+getchr= function(x) (positions %>% filter(V1==x))[1,"V2" ]
+    
+    msg("preparing chromosome annotation...")
+    chrs=lapply(dt %>% colnames, getchr) %>% Reduce(c, .) 
+    colanno= chrs  %>% as.data.frame(., row.names=dt %>% colnames) 
+    colnames(colanno)="chromosome"
+    colanno= colanno %>% mutate(chromosome=factor(chromosome, levels= addprefix(1:22, prefix="chr"))) 
+    filterchrs=F
+    if(!filterchrs){
+      allchrs= unique(chrs)
+      
+    }else{
+      allchrs=c("chr2", "chr17")
+    }
+    colanno= colanno %>% filter(chromosome %in% allchrs)
+    
+    
+    dt=dt[, rownames(colanno)]
+
+    pha= ComplexHeatmap::pheatmap( dt , 
+                                   scale="col",
+                                   annotation_col=colanno, 
+                                   annotation_colors=allcolors,
+                                   cluster_row=F, 
+                                   cluster_col=F,
+                                   show_colnames=F,
+                                   border_color=NA,
+                                   use_raster=T,
+                                   show_rownames=F, 
+                                   breaks=br,
+                                   color=colls,
+                                   left_annotation=hal, 
+                                   legend=T
+                                   
+                                   
+                                   
+    )
+  
+        sca=1
+    rr=600;
+    msg("dumping heatmap to figure...")
+    tpdf(path=params$plotpath, paste_("pheatmapcol4simple", "_patient", pt, "mappingfilter", th, "readsfilter", qcpars3$allpatients$counts), width=pw*1.25*sca, height=pw*.9*sca)#), res=rr)
+    print(pha)
+    dev.off()
+    
+})
+
+
+
+```
+
+
+## Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```

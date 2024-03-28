@@ -1,0 +1,106 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: 02_integration of the whole dataset using Seurat"
+author: "Luis Montano"
+date: '2023-07-18'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+
+ 
+
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Integration of all datasets past quality control with scvi and the adrenal gland label transfer. 
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R It also requires the output of the script 02_1, 02_2, and 02_3. 
+
+## Outputs
+
+The output of this script is a list of post-qc seurat objects that will be used for integration and other purposes, stored in variable solist2, and inside the RData object "ncnb2-filteredcovariates-seuratobjects_with_markers_vfeatures_vfeatures" where vfeatures is the number of variable features used. 
+
+seurat_alldatasets_scvi_hvg.RData
+
+### Import functions and set parameters. click on the "run all chunks above" icon below  to reload parameters
+
+```{r}
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+
+nn=30L;
+mindist=.3;
+md=0.3
+res=.5
+pcdims=30
+vfeatures=2000
+selecttop=5
+minfc=0.5
+mincpm=3
+pcdims=30
+
+fdr=0.05
+vfeatures.rna=5000
+```
+
+## Load the full in vitro dataset with markers
+
+```{r}
+fullrecreate=F; fullreload=T
+
+simpleCache("simple_merge_all_filtered_datasets", assignToVar="sma", reload=T)
+
+```
+
+
+## Importing scvi integration assay, which was run in a GPU server, together with the Kameneva Jansky mappings
+
+```{r}
+fullrecreate=T; fullreload=F
+
+
+simpleCache("seurat_alldatasets_scvi_hvg", {  
+simpleCache("seurat_scviall_RNA_counts_hvg", assignToVar="scvi", reload=T)
+
+scvi=RenameAssays(scvi, SCT="sctscvi")
+sma@assays$sctscvi=scvi@assays$sctscvi
+sma@reductions$scvi=scvi@reductions$scvi
+
+rm(scvi)
+gc()
+
+
+DefaultAssay(sma)="sctscvi"
+
+################################################################################
+# Incorporate corrected conditions on metadata
+################################################################################
+
+simpleCache("allpostqc-metadata-correctedcondition",{
+sma %>% metadata %>% mutate(ccondition.precorrection=ccondition, ccondition.corrected=correctcondition(dsname, ccondition), ccondition=ccondition.corrected)
+}, assignToVar="allmetadata.corrected", reload=T)
+
+sma= AddMetaData(sma, metadata= allmetadata.corrected %>% select(ccondition.precorrection, ccondition.corrected, ccondition))
+ 
+################################################################################
+# incorporate kameneva mapping metadata
+################################################################################
+simpleCache("kameneva_integration_metadata_fulldataset", assignToVar="mappedmeta", reload=T)
+ 
+ sma <- AddMetaData(sma, mappedmeta)
+  sma@meta.data= sma %>% metadata %>% mutate(type2=type) 
+sma
+}, assignToVar="sma", reload=fullreload, recreate=fullrecreate)
+```
+
+## Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,1498 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: 04_WT_projecting_other_cell_lines_onto_wildtype"
+author: "Luis Montano"
+date: '2023-08-07'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+  outpath: '~/mnt_out/figures/'
+  resourcepath: "~/mnt_resources/"
+  fig_width: 6
+  fig_height: 4
+---
+# Projecting cells from other stages to the WT as reference
+## Overview
+
+This script uses related (but not identical) versions of some functions to deal with the mapping to the WT cell reference of
+a) 10x Genomics samples (cWT, c17q, c17q1q, c17q1qMYCN)
+b) Parse Bioscience Samples
+
+processing for each subgroup has been indicated where possible.
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R It requires the seurat_WT_processed_clusters_markers.RData seurat object produced previously as well as the output of scrna/02_4
+
+## Outputs
+
+* The processed WT dataset with clusters seurat_WT_processed_clusters_markers.RData
+* Most of the contents of Fig 2 and some of the contents of Supplementary figure 8. 
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load functions and relevant variables, and prepare workspace
+
+```{r}
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+vfeatures=5000
+pcdims=30
+umapdims=10
+sz=.02
+threed=F #use if a 3d umap is desired
+tsca=200
+
+################################################################################
+# setting UMAP parameters
+################################################################################
+  wtumapdims=10
+  wtnn=30
+  wtag="WT"
+  wtmd=0.4
+  pval=0.05
+  padj=pval
+  minfc=.3
+  fdr=0.05
+  selecttop=20
+  ncells.show=200
+  method.markers="deseq"
+  method.seriate="seurat"
+################################################################################
+#### comparison heatmap parameters
+################################################################################  
+  numcells=100
+
+################################################################################
+# recreation/ reloading controls
+################################################################################  
+loadcontrols=list()
+  loadcontrols$wtmarkers=list(
+ loadfulldata="reload",
+ processraw="reload",
+ calculateclusters="recreate"
+  )
+################################################################################
+#glasswork plot parameters
+################################################################################
+gwvarr="stage"
+
+  sca=10
+  rr=600
+  ssca=200
+  varrlab=gwvarr
+  sca=10
+  rr=600
+  ssca=180
+  hullpointsize=0.05
+  linesize=0.1
+  fillvar="clusterfrac"
+
+plotmeth="jitter"
+
+################################################################################
+# mapped cell analysis
+################################################################################
+
+nmappedcells.show=500
+
+################################################################################
+#cellinfo and seriation parameters
+################################################################################
+
+smeth="seurat"
+finalclusvar.wt="WT.clusters"
+```
+
+```{bash}
+
+conda 
+pip install leidenalg
+pip install pandas
+```
+
+```{r}
+#load integrated single cell experiment wih data across all datasets
+
+fullrecreate=F; fullreload=T
+simpleCache("seurat_scviall_RNA_counts_hvg", assignToVar="sma", reload=T)
+sma= RenameAssays(sma, SCT="sctscvi")
+
+ simpleCache("kameneva_integration_metadata_fulldataset", assignToVar="mappedmeta", reload=fullreload, recreate=fullrecreate)
+ 
+ sma <- AddMetaData(sma, mappedmeta)
+ 
+ sma@meta.data= sma %>% metadata %>% mutate(type2=type) 
+
+```
+
+## importing wt dataset
+
+```{r loadwt}
+
+simpleCache("seurat_WT_processed_clusters_markers", {scwt}, 
+            #recreate=T,
+            reload=T,
+            assignToVar="scwt")
+```
+
+## Load parse datasets (H9 cell lines, 17q mycn -, 17q mycn+  wt mycn -, wt mycn +
+
+```{r loadparse}
+
+get.parse.dataset=function(ii, aslist=T){
+datte="2023-12-29"
+simpleCache("parse_samples_genotype_table_actualgenotypescorrected", {gentable.filtered}, assignToVar="cts", reload=T)
+
+
+p=cts[ii, "parental"] %>% as.character
+cond=cts[ii, "actual.cgenotype"] %>% as.character
+  
+simpleCache(paste0("so_parse_selected_processed", p, cond), assignToVar="so", reload=T)
+if(aslist){
+list(seurat=so, parental=p, condition=cond)
+}else{
+  so
+}
+}
+
+```
+
+## create UMAP with above parameters.
+
+```{r, fig.width=10, fig.height=10}
+simpleCache("wtumap_pars", assignToVar="wtumap.pars", reload=T)
+
+wtumap.pars %>% dput
+```
+
+## Selecting UMAP parameters and plotting the WT UMAP across stages
+
+```{r}
+
+sca=10
+rr=600
+varr="stage"
+varrlab=varr
+rerun.umap=F
+umapchoice=22
+  ur=wtumap.pars[[umapchoice]]$umapname
+  ass=wtumap.pars[[umapchoice]]$assay
+  red=wtumap.pars[[umapchoice]]$pcared
+  rk=wtumap.pars[[umapchoice]]$reduction.key
+  nn=wtumap.pars[[umapchoice]]$nn
+  md=wtumap.pars[[umapchoice]]$md
+  umapdims=wtumap.pars[[umapchoice]]$umapdims
+    if(!is.null(wtumap.pars[[umapchoice]]$umapclusres)){
+  umapclusres=wtumap.pars[[umapchoice]]$umapclusres
+    }
+  
+  if(rerun.umap==T){
+             scwt=RunUMAP(scwt, reduction=red, assay=ass, dims=1:umapdims, n.neighbors=nn, min.dist=md, reduction.name=ur, reduction.key=rk, return.model=T) 
+  }
+
+  sca=15
+tpng(path=params$plotpath, paste_("UMAPwt", varr), wi=w*sca, he=w*sca, res=rr)
+wp=ggumap(scwt, colorby=varr, labelby=varrlab, reduction=ur, reduction.key=rk, colorlist=allcolors, ssca=350)+NoAxes()+NoLegend()
+wp
+dev.off()
+wp
+```
+
+
+## Mapping 10X mutants to wild type
+
+```{r map10x}
+fullreload.map10x=T
+fullrecreate.map10x=F
+library(viridis)
+refass=wtass
+queryass="refAssay"
+
+red="pca"
+
+clusvarname=finalclusvar.wt
+################################################################################
+#assign colors to cluster variables if they don't exist yet
+################################################################################
+if (is.null(allcolors[[clusvarname]])){
+  catnames=umapscwt %>% pull(!!sym(clusvarname)) %>% unique
+allcolors[[clusvarname]]=randomcolors(catnames %>% length) %>% givename(., catnames)
+
+}
+allcolors[[mapfun(clusvarname)]]=allcolors[[clusvarname]] 
+allcolors[["predicted.id"]]=allcolors[[clusvarname]]
+
+
+conds=c( "cWT", "c17q",  "c17q1q", "c17q1qMYCN")
+customcols=c("ccondition", "stage", "type", "kamenevatype", "WT.clusters")
+mappingvars= c( clusvarname, "stage")
+
+################################################################################
+# map different conditions to WT and transfer labels, one at a time
+################################################################################
+
+## add other resolutions
+allmaps=lapply(conds, function(cond){
+  
+  gc()
+
+      simpleCache(paste_("seurat_subset_reprocessed_ccondition10x", cond), {
+      
+      que=sma[, sma %>% metadata %>%filter(ccondition == cond) %>% rownames]
+      que=SCTransform(que, new.assay.name="refAssay", method="glmGamPoi", vars.to.regress="ccvar", variable.features.n=vfeatures)
+  
+                                                                        }, assignToVar="que", reload=T)
+    if(!("WT.clusters" %in% (metadata(que) %>% colnames))){
+    que[["WT.clusters"]]=NA  
+    }
+
+    lapply(mappingvars, function(varr){
+    simpleCache(paste0("mappinginfo_condition", "10x", cond, "to_WT_mapvar", varr), {
+################################################################################
+# performing the mapping
+################################################################################        
+fcat("performing mapping to", varr)
+    maplist=maptoref.pt1(query=que, 
+                     refdataset=scwt,
+                     ref.assay=refass,
+                     query.assay=queryass,
+                     mapvar=varr,
+                     querylabel=cond,
+                     reflabel="WT",
+                     reference.pca=red,
+                     reference.umap=wtur,
+                     reference.neighbors=umapnn.name.nns,
+                     return.merge.metadata=F,
+                     return.query.metadata=TRUE,
+                     customcol=customcols,
+                     process.reference=F
+                    
+                     )
+  
+  mapcon=maptoref.pt2(query=maplist$query, refdataset=maplist$ref,anchors=maplist$anchors, ref.assay=refass,query.assay=queryass, mapvar=varr, querylabel=cond, reflabel="cWT",  reference.pca=red, reference.umap=wtur, reference.neighbors=umapnn.name.nns, return.merge.metadata=F, return.query.metadata=TRUE, customcol=customcols, process.reference=F)
+  mapcon
+  },  assignToVar="mapcon", recreate=fullrecreate.map10x, reload=fullreload.map10x)
+
+  mapcon}) %>% givename(., mappingvars)
+
+}) %>% givename(., conds)
+
+
+################################################################################
+# assembling everything into a table
+################################################################################
+
+mapdf=lapply(allmaps %>% names, function(cond){
+ 
+  dd=lapply(allmaps[[cond]] %>% names, function(varr){
+    allmaps[[cond]][[varr]] %>% dplyr::select(stage,ccondition,  kamenevatype, type, !!sym(mapfun(varr)), !!sym(paste0(mapfun(varr), "_predicted.id.score")))
+  }) %>% Reduce(cbind, .)
+  
+  dd= dd[, !duplicated(colnames(dd))] %>% as.data.frame
+   
+}) %>% Reduce(rbind,.)
+
+mapdf.original=mapdf
+```
+
+
+```{r map10xdata}
+################################################################################
+#incorporating mapping data as full dataset metadata
+################################################################################
+
+#remove "query" label from the wt cells
+rmquery=Vectorize(function(x){if(grepl("query",x)){
+strsplit(x, split="query_")[[1]][2]
+  }else{x} }, USE.NAMES=F)
+
+mapmetadata=mapdf %>% select(mapblock.condition=ccondition, mapfun_stage, mapfun_stage_predicted.id.score,mapfun_WT.clusters, mapfun_WT.clusters_predicted.id.score ) %>% names2col(., "cellid") %>% mutate(cellid=rmquery(cellid)) %>% col2names(., "cellid")
+
+sma=AddMetaData(sma, metadata=mapmetadata)
+
+
+fwrite(umapdf(sma, red="umap.fullscvi8"), file=file.path(params$outpath, "figuredata_metadata_fulldataset_wmapping_and_nnmutscore_umap.csv"))
+
+```
+
+
+## Prep for Figure 2 b, c, d Glasswork plots mapping mutants to wt dataset divided by condition coloured by stage
+
+```{r tenxglassworks}
+sca=1
+downsample=1
+concavity=2
+hullpointsize=0.005
+linesize=0.15
+colorpoints="stage"
+includestages= c("D9", "D14", "D19" )
+varr=finalclusvar.wt
+
+
+mapdf2=mapdf %>% names2col(., "cellid") %>% filter(stage %in% includestages) %>% group_by(ccondition, stage) %>% sample_n(790, replace=F) %>% ungroup() %>% as.data.frame %>%
+col2names(., "cellid")
+
+rescalecells=NULL
+
+glassworkplots=lapply(1:length(conds), function(numcond){
+  
+cond= conds[numcond]
+mapcons= mapdf2 %>% dplyr::filter(ccondition== !!cond)#, mapfun_WT.clusters_predicted.id.score>=0.6)
+fcat("made mapcon")
+print(mapcons)
+
+destinyclusters=mapcons %>% dplyr::group_by(!!sym(mapfun(varr))) %>% summarise(counts=n()) %>% as.data.frame %>% arrange(-counts)
+  
+ fcat("made destinyclusters") 
+  ##collect all the destinies of each cell in each  together
+  
+  des=destinyclusters %>% mutate(tot= sum(counts), frac=counts/tot) %>% col2names(., mapfun(varr))
+
+  fcat("made des")
+
+  umapsma= umapdf(scwt, reduction=wtur)
+
+  if(plotmeth=="jitter"){
+  ##############################################################################
+  # jittered points method
+  ##############################################################################
+    ############################################################################
+    # Construct a blank scaffold plot for the mapped cells to come on top
+    ############################################################################
+    
+    lims=umapsma %>% select(!!sym(wtrk %>% paste0(., "1")), !!sym(wtrk %>% paste0(., "2"))) %>% summarise(minx=min(!!sym(wtrk %>% paste0(., "1"))) , maxx=max(!!sym(wtrk %>% paste0(., "1"))), miny=min(!!sym(wtrk %>% paste0(., "2"))), maxy=max(!!sym(wtrk %>% paste0(., "2"))))
+    
+    blankscaffoldplot=ggplot()+geom_point_rast()+coord_cartesian(xlim=c(lims$minx, lims$maxx), ylim=c(lims$miny, lims$maxy))+theme_classic()
+    
+  ##############################################################################
+  # construct point bubbles
+  ##############################################################################
+
+    
+    polys<-clusterhullpoint(NULL, umap.df=umapsma, clusvar=varr, query.df=mapcons
+                            #%>% filter(stage==!!inc)
+                          , clus=umapsma %>% pull(!!sym(varr)) %>% unique, fillvar="null", linecolor="#000000", colorpoints=colorpoints, size=linesize, pointsize=hullpointsize, reduction.key=wtrk, downsample=downsample, concavity=concavity, rescale.cells=rescalecells)
+
+    
+    fcat("made polys")
+################################################################################
+# scaffold plot
+################################################################################
+    polys.scaffold<-clusterhull3(NULL, umap.df=umapsma, clusvar=varr, clus=umapsma %>% pull(!!sym(varr)) %>% unique, fillvar="null", linecolor="#000000", size=linesize, reduction.key=wtrk, concavity=concavity)
+    
+  fcat("made polys.scaffold")
+  
+
+tpdf(path=params$outpath, paste0("clusterhull_mapping_emptyhulls_clusterres", umapclusres, paste0(includestages, collapse="-")),wi=pw*sca, he=pw*sca)#,  res=rr) 
+print(blankscaffoldplot+polys.scaffold+NoLegend()+NoAxes())
+dev.off()
+
+tpdf(path=params$outpath, paste0("clusterhull_mapping_emptyhulls_clusterres", umapclusres, paste0(includestages, collapse="-")),wi=w*sca, he=w*sca,  )#res=rr) 
+print(blankscaffoldplot+polys.scaffold+NoLegend()+NoAxes())
+dev.off()
+  
+  ############################################################################
+    # Assembling a list of all the components of the plot
+    ############################################################################
+    pl= append(list(blankscaffoldplot), polys) 
+    
+    if (colorpoints!="null" && colorpoints %in% names(allcolors)){
+      
+      pl=append(pl, scale_color_manual(values=allcolors[[colorpoints]]))
+    }else{
+      pl=append(pl, scale_color_manual(values=c(one="FFFFFF00")))
+    }
+    
+    ############################################################################
+    # go from a list of plots to one ggplot assembly
+    ############################################################################
+    plo=pl%>% Reduce('+', .) +
+    scale_fill_manual(values=c(one="white"))+
+    NoAxes()+NoLegend()+ggtitle(cond)
+  
+}else{
+  
+  
+  ##############################################################################
+  # real positions method
+  ##############################################################################   
+  if(plotmeth=="real"){
+  polys=clusterhull(NULL, umap.df=umapsma, clusvar=varr, clus=NULL, fillvar="null", linecolor="#000000", size=0.5, reduction.key=wtrk, fillcols="#FFFFFF00")
+  
+      polys2=clusterhull(NULL, umap.df=umapsma, clusvar=varr, clus=NULL, fillvar=varr, linecolor="#000000", size=0.5, reduction.key=wtrk, fillcols="#FFFFFF00")
+  
+
+    
+    mapped.cells.umap=ggumap(so=scwt, umap.df=mapcons, colorby=mapfun(varr), labelby=mapfun(varr), reduction.key=wtrk , colorlist=allcolors)
+      
+      plo=mapped.cells.umap+polys+NoAxes()+ggtitle(cond)
+      plo2=mapped.cells.umap+polys2+NoLegend()+NoAxes()+ggtitle(cond)
+      plo+plo2
+  }
+  
+
+    tpdf(path=params$outpath, paste_("UMAP_with_hullandpoints_10x_", cond, "to-WT_method_", plotmeth, "clusterby",varr, "resolution", rs, "colorpoints_by",colorpoints, "includestages", includestages, "rescaled", rescalecells), wi=pw*sca, he=pw*sca)#, res=rr)
+    
+    
+    print(
+      plo
+    )
+    dev.off()
+    plo
+    
+ } })
+
+gc()
+
+for(x in 1:length(conds)){
+
+  cond=conds[x]
+tpdf(path=params$outpath, paste0("clusterhull_mapping_10x", cond, "to_wt_by_", varr, "_coloredby", colorpoints, "clusterres", umapclusres, "includestages", paste(includestages, collapse="-"), "_rescale", rescalecells),wi=pw*sca, he=pw*sca)#,  res=rr) 
+print(glassworkplots[[x]])
+dev.off()
+}
+
+
+glassworkplots %>% Reduce('+', .)
+```
+
+Plot all mutants together, colored by approximate type. using mapdf2 from above
+```{r}
+sca=1
+varr="WT.clusters"
+rescalecells=NULL
+colorpoints="type3"
+conds=c( "c17q", "c17q1q", "c17q1qMYCN")
+hullpointsize=.001
+  
+mapcons= mapdf2 %>% dplyr::filter(ccondition %in% conds) %>% mutate(type3=masktype3(type))
+fcat("made mapcon")
+print(mapcons)
+
+destinyclusters=mapcons %>% dplyr::group_by(!!sym(mapfun(varr))) %>% summarise(counts=n()) %>% as.data.frame %>% arrange(-counts)
+  
+ fcat("made destinyclusters") 
+  ##collect all the destinies of each cell in each  together
+  
+  
+  des=destinyclusters %>% mutate(tot= sum(counts), frac=counts/tot) %>% col2names(., mapfun(varr))
+
+  fcat("made des")
+
+  umapsma= umapdf(scwt, reduction=wtur)
+  
+  if(plotmeth=="jitter"){
+  ##############################################################################
+  # jittered points method
+  ##############################################################################
+    ############################################################################
+    # Construct a blank scaffold plot for the mapped cells to come on top
+    ############################################################################
+    
+    lims=umapsma %>% select(!!sym(wtrk %>% paste0(., "1")), !!sym(wtrk %>% paste0(., "2"))) %>% summarise(minx=min(!!sym(wtrk %>% paste0(., "1"))) , maxx=max(!!sym(wtrk %>% paste0(., "1"))), miny=min(!!sym(wtrk %>% paste0(., "2"))), maxy=max(!!sym(wtrk %>% paste0(., "2"))))
+    
+    blankscaffoldplot=ggplot()+geom_point_rast()+coord_cartesian(xlim=c(lims$minx, lims$maxx), ylim=c(lims$miny, lims$maxy))+theme_classic()
+    
+  ##############################################################################
+  # construct point bubbles
+  ##############################################################################
+
+    
+    polys<-clusterhullpoint(NULL, umap.df=umapsma, clusvar=varr, query.df=mapcons
+                            #%>% filter(stage==!!inc)
+                          , clus=umapsma %>% pull(!!sym(varr)) %>% unique, fillvar="null", linecolor="#000000", colorpoints=colorpoints, size=linesize, pointsize=hullpointsize, reduction.key=wtrk, downsample=downsample, concavity=concavity, rescale.cells=rescalecells)
+
+    
+    fcat("made polys")
+################################################################################
+# scaffold plot
+################################################################################
+    polys.scaffold<-clusterhull3(NULL, umap.df=umapsma, clusvar=varr, clus=umapsma %>% pull(!!sym(varr)) %>% unique, fillvar="null", linecolor="#000000", size=linesize, reduction.key=wtrk, concavity=concavity)
+    
+  fcat("made polys.scaffold")
+  
+
+tpdf(path=params$outpath, paste0("clusterhull_mapping_emptyhulls_clusterres", umapclusres, paste0(includestages, collapse="-")),wi=pw*sca, he=pw*sca)#,  res=rr) 
+print(blankscaffoldplot+polys.scaffold+NoLegend()+NoAxes())
+dev.off()
+
+tpdf(path=params$outpath, paste0("clusterhull_mapping_emptyhulls_clusterres", umapclusres, paste0(includestages, collapse="-")),wi=w*sca, he=w*sca,  )#res=rr) 
+print(blankscaffoldplot+polys.scaffold+NoLegend()+NoAxes())
+dev.off()
+  
+  ############################################################################
+    # Assembling a list of all the components of the plot
+    ############################################################################
+    pl= append(list(blankscaffoldplot), polys) 
+    
+    if (colorpoints!="null" && colorpoints %in% names(allcolors)){
+      
+      pl=append(pl, scale_color_manual(values=allcolors[[colorpoints]]))
+    }else{
+      pl=append(pl, scale_color_manual(values=c(one="FFFFFF00")))
+    }
+    
+    ############################################################################
+    # go from a list of plots to one ggplot assembly
+    ############################################################################
+    plo=pl%>% Reduce('+', .) +
+    scale_fill_manual(values=c(one="white"))+
+    NoAxes()+NoLegend()+ggtitle("Mutants mapped to wild type")
+  
+}else{
+  
+  
+  ##############################################################################
+  # real positions method
+  ##############################################################################   
+  if(plotmeth=="real"){
+  polys=clusterhull(NULL, umap.df=umapsma, clusvar=varr, clus=NULL, fillvar="null", linecolor="#000000", size=0.5, reduction.key=wtrk, fillcols="#FFFFFF00")
+  
+      polys2=clusterhull(NULL, umap.df=umapsma, clusvar=varr, clus=NULL, fillvar=varr, linecolor="#000000", size=0.5, reduction.key=wtrk, fillcols="#FFFFFF00")
+  
+
+    
+    mapped.cells.umap=ggumap(so=scwt, umap.df=mapcons, colorby=mapfun(varr), labelby=mapfun(varr), reduction.key=wtrk , colorlist=allcolors)
+      #ggplot(mapcon, aes(x=!!sym(rk %>% paste0(., "1")), y=!!sym(rk %>% paste0(., "2"))))+geom_point(color="white")+theme_classic();
+      
+      plo=mapped.cells.umap+polys+NoAxes()+ggtitle(cond)
+      plo2=mapped.cells.umap+polys2+NoLegend()+NoAxes()+ggtitle(cond)
+      plo+plo2
+  }
+  
+
+    tpdf(path=params$outpath, paste_("UMAP_with_hullandpoints_10x_allconditionsto-WT_method_", plotmeth, "clusterby",varr, "resolution", rs, "colorpoints_by",colorpoints, "includestages", includestages, "rescaled", rescalecells), wi=pw*sca, he=pw*sca)#, res=rr)
+    
+    
+    print(
+      plo
+    )
+    dev.off()
+    plo
+    
+ }
+
+gc()
+
+
+tpdf(path=params$outpath, paste0("clusterhull_mapping_10x_allconditions_to_wt_by_", varr, "_coloredby", colorpoints, "clusterres", umapclusres, "includestages", paste(includestages, collapse="-"), "_rescale", rescalecells),wi=pw*sca, he=pw*sca)#,  res=rr) 
+print(plo)
+dev.off()
+
+
+
+
+```
+
+
+
+## Fig 2 c quantify developmental retardation per genotype.
+
+```{r, fig.width=8}
+allcolors[["relative_dev"]]=c( delayed="red", on_time="green", accelerated="blue" )
+allcolors[["closest_wt_stage"]]=allcolors$stage
+allcolors[["sampling_stage"]]=allcolors$stage
+delaybreaks=seq(-28, 28, 1)
+allcolors[["days_to_wt"]]=colorRampPalette(c("dark red", "white", "blue"), space="rgb")(delaybreaks %>% length) %>% givename(., delaybreaks)
+allcolors[["timeliness"]]=c(severe_delay="#8B0000", delay="#C07676", on_time="#FFFFFF", accel="#7676FF", severe_accel="#0000FF")
+
+comparestagesimple=Vectorize(function(realcat,mappedcat){
+  if (realcat==mappedcat) {return("on_time")}
+  else{if((as.integer(substr(mappedcat,2,3)) >as.integer(substr(realcat,2,3))) ){return("accelerated")}else{
+    if((as.integer(substr(mappedcat,2,3)) <as.integer(substr(realcat,2,3))) ){return("delayed")}
+  }
+  }
+}, USE.NAMES=F)
+
+subtractstage=Vectorize(function(realcat,mappedcat){
+  num=as.integer(substr(mappedcat,2,3)) - as.integer(substr(realcat,2,3))
+  num
+  }, USE.NAMES=F)
+
+subtractstage.categorical=Vectorize(function(realcat,mappedcat){
+  num=as.integer(substr(mappedcat,2,3)) - as.integer(substr(realcat,2,3))
+   sdt=-5
+   sat=5
+  if(num<sdt){return("severe_delay")}
+  if(num>=sdt & num<0 ){return("delay")}
+  if( num==0 ){return("on_time")} 
+  if(num>0 & num<=(sat)){return("accel")}
+  if(num>sat){return("severe_accel")}
+   
+  }, USE.NAMES=F)
+
+################################################################################
+# Calculating delays with respect to WT
+################################################################################
+
+mapdf.delay= mapdf %>% filter(!(stage %in% c("D0", "D3", "D6", "D10", "D12", "D28")), ccondition %in% c("cWT", "c17q", "c17q1q", "c17q1qMYCN")) %>% mutate( sampling_stage=stage, relative_dev=comparestagesimple(stage, mapfun_stage), closest_wt_stage=mapfun_stage, days_to_wt=subtractstage(stage, mapfun_stage), timeliness=subtractstage.categorical(stage, mapfun_stage))
+
+################################################################################
+# Figure 2 c Plotting correspondences
+################################################################################
+
+cw=0.6
+sca=.8
+tpdf(path=params$outpath, "transferplot_mutantstage_to_wt_stage", wi=pw*sca*1.5, he=pw*sca*1.5)
+transferplot(so=NULL, df=mapdf.delay, labelvars=c( "closest_wt_stage", "sampling_stage"), facetvar="ccondition", facet.ncol=1, facet.nrow=4, column.width=cw)+scale_y_reverse()+coord_flip()
+dev.off()
+
+
+```
+
+
+
+DE analysis of cells triaged into different wt stages or clusters.
+
+```{r, fig_height}
+
+simpleCache("wtheatmap_clusterinfo_genes_lfct_0.3_numtop_250minrate0.5_2023-10-19seriationmethodseuratncells300", assignToVar="wtcellinfo", reload=T)
+
+wtmarkers= wtcellinfo$markerlist
+
+allmarkers=list()
+alltopmarkers=list()
+for(i in 11:nrow(cts)){
+p=cts[i, "parental"] %>% as.character
+cond=cts[i, "condition"] %>% as.character
+metacond=cts[i, "metacondition"] %>% as.character  
+simpleCache(paste0("so_parse_selected_processed", p, cond), assignToVar="so", reload=T)
+
+ percent.mt<- PercentageFeatureSet(so, pattern = "^MT-") %>% givecolnames(., nms="percent.mt")
+ so@meta.data= cbind(so@meta.data,  percent.mt)
+
+ mappedcells.df= mapdf %>% filter(metacondition==!!metacond, stage %in% includestages) 
+  mappedcells= mapdf %>% filter(metacondition==!!metacond, stage %in% includestages) %>% rownames
+
+  so= so[, mappedcells]
+  so@meta.data=cbind(so@meta.data, mappedcells.df) 
+  so@meta.data= so@meta.data[,!(so %>% metadata %>% colnames %>% duplicated)]
+ 
+ cluslabel=mapfun(clusvarname)
+options(future.globals.maxSize = 2 * 10^9)
+fullreload=F; fullrecreate=T
+datte="2023-10-20" #chopstring(timestamp(""))
+verbose=F
+meth="edger"
+groupvar="group1"
+pvar="padj"
+thresh=pval
+fcvar="log_fc"
+minrate=.1
+replicatecol="rep_num"
+pastedstages=paste0(includestages, collapse="-")
+ 
+simpleCache(paste_("seurat_parse_mappedto10xWT", p, cond, pastedstages, "_with_mappedcellmarkers_delegate", datte), {
+  nm=paste0("parse",p,cond)
+fcat(paste0("finding markers using the DElegate package...\n") ) 
+
+simpleCache(paste_("markers_cellsmappedtoWT10x_parse_parental",p, "condition", cond, "stage", pastedstages, "on_clusters_of", cluslabel,"method", meth, datte), {
+  
+ 
+ m= DElegate::FindAllMarkers2(object=so, group_column=cluslabel, replicate_column=replicatecol, method=meth, min_fc=0.3, min_rate=minrate)
+
+  
+}, assignToVar="m", reload=T, recreate=F)
+
+   clusters=m %>% pull(get(groupvar)) %>% unique %>% substr(., 2,5) %>% as.numeric %>% sort %>% paste0("C", .) 
+ ## arrange and filter best markers
+    
+  if(is.null(selecttop)){
+  lt=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc>=minfc) %>% arrange(log_fc))
+  topstr=""  
+}else{
+  lt=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc>=minfc) %>% arrange(log_fc) %>% head(n=selecttop))
+}
+
+     if(is.null(selectbottom)){
+  ltb=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc<=-minfc) %>% arrange(log_fc))
+  topstr=""  
+}else{
+  ltb=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc<=-minfc) %>% arrange(log_fc) %>% head(n=selecttop))
+}   
+  
+    mb=ltb %>% Reduce(rbind,.) %>% mutate(metacondition=metacond)
+    
+    
+alltopmarkers[[metacond]]=mp
+allmarkers[[metacond]]=m
+
+cat("Number of filtered markers: ", nrow(mp), "(", (nrow(mp)/nrow(m))*100, "% markers post filtering)\n")
+so$RNA@misc$markers <- m
+so$RNA@misc$top_markers <- mp
+so$RNA@misc$bottom_markers <- mb
+cat("Dataset", nm, ": calculating residuals for missing genes in scale data...\n")
+so <- GetResidual(so, features = so$RNA@misc$top_markers$feature, verbose = F)
+}, assignToVar="so", reload=F, recreate=T)
+
+### compare how strong the WT marker signature is for the condition at hand.
+
+simpleCache(paste_("cellinfo_parse_metacondition", metacond  ), {
+
+cellinfo.mappedcells= seriatecells(so, clusvar=mapfun(clusvarname), meth=smeth, clusters=clusters,groupvarname=groupvar,lfcvarname=fcvar, extended.output=T, deduped=T, ncells=500)
+cellinfo}, assignToVar="cellinfo.mappedcells", recreate=fullrecreate, reload=fullreload)
+
+
+ 
+}  
+```
+
+
+## Map parse samples to WT reference, using the pca as the projection
+
+```{r mapparse}
+fullrecreate=F; fullreload=T
+library(viridis)
+library(concaveman)
+refass=ass
+queryass="refAssay"
+rs=umapclusres
+red="pca"
+clusvarname="WT.clusters"
+umapscwt=umapdf(scwt, red=ur)
+################################################################################
+#assign colors to cluster variables if they don't exist yet
+################################################################################
+
+
+conds=c("c17q", "c17q1q", "c17q1qMYCN", "c17qm", "c17qMYCN", "cMYCN", 
+"cWT", "cWTm", "c17q", "c17q1q", "c17q1qMYCN", "cWT")
+
+
+
+customcols=c("ccondition", "stage", "type", "kamenevatype")
+customcols=c("stage", "condition", "seurat_clusters", "rep_num", "parental")
+mappingvars= c( clusvarname, "stage")
+
+################################################################################
+# map different conditions to WT and transfer labels, one at a time
+################################################################################
+
+## add other resolutions
+simpleCache("allparsemaps", {
+
+allmaps=lapply(1:length(conds), function(numcond){
+
+  sl=get.parse.dataset(numcond)  
+  que=sl$seurat
+  
+  p=sl$parental
+  cond=sl$condition
+  newcondition= paste0("parse",cond, p)
+  
+  que@meta.data= que@meta.data %>% mutate(stage= paste0("D", day), parental=!!p, condition=!!cond, metacondition=!!newcondition)
+  
+  lapply(mappingvars, function(varr){
+  gc()
+  
+  simpleCache(paste0("mappinginfo_condition", newcondition, "to_WT_mapvar", varr, "clusresolution", umapclusres), {
+      
+        
+      que= RenameAssays(que, SCT="refAssay")
+
+  
+
+################################################################################
+# performing the mapping
+################################################################################        
+maplist=maptoref.pt1(query=que, 
+                     refdataset=scwt,
+                     ref.assay=refass,
+                     query.assay=queryass,
+                     mapvar=varr,
+                     querylabel=paste0("parse",cond, p),
+                     reflabel="cWT",
+                     reference.pca="pca",
+                     reference.umap=ur,
+                     reference.neighbors=umapnn.name.nns,
+                     return.merge.metadata=F,
+                     return.query.metadata=TRUE,
+                     customcol=customcols,
+                     process.reference=F, 
+                     #pdms=1:10
+                     )
+  
+  mapcon=maptoref.pt2(query=maplist$query,
+                      refdataset=maplist$ref,
+                      anchors=maplist$anchors,
+                      ref.assay=refass,
+                      query.assay=queryass,
+                      mapvar=varr,
+                      querylabel=paste0("parse",cond, p),
+                      reflabel="cWT",
+                      reference.pca="pca",
+                      reference.umap=ur,
+                      reference.neighbors=umapnn.name.nns,
+                      return.merge.metadata=F,
+                      return.query.metadata=TRUE,
+                      customcol=customcols,
+                      process.reference=F)
+  mapcon
+  },  assignToVar="mapcon", recreate=fullrecreate, reload=fullreload)
+
+  mapcon}) %>% givename(., mappingvars)
+
+}) %>% givename(., cts %>% mutate(nt= paste0("parse", condition, parental)) %>% pull(nt))
+
+allmaps}, assignToVar="allmaps", reload=T)
+
+################################################################################
+# import table with "actual genotypes" after genotyping
+################################################################################
+
+gentable=fread(file.path(params$outpath, "parse_repliate_counts_per_day_mod.csv"))
+colnames(gentable)=make.names(colnames(gentable))
+gentable= gentable %>% mutate(actual.cgenotype=paste0("c", actual.genotype), stage=paste0("D", day))
+gentable[["condition"]]=gsub( "cMYCN", "cWTMYCN", gentable[["condition"]])
+
+################################################################################
+# assembling everything into a table
+################################################################################
+
+mapdf=lapply(names(allmaps), function(cond){
+ 
+  dd=lapply(allmaps[[cond]] %>% names, function(varr){
+
+    
+    
+     tb=allmaps[[cond]][[varr]] %>% dplyr::select( origin, condition,stage,parental,rep_num, !!sym(mapfun(varr))) %>% mutate(metacondition=paste0("parse", condition, parental))
+    sta= tb %>% pull(stage) %>% unique 
+    condd= tb %>% pull(condition) %>% unique
+    parenta= tb %>% pull(parental) %>% unique
+    
+  
+   
+  }) %>% Reduce(cbind, .)
+  
+  dd= dd[, !duplicated(colnames(dd))] %>% as.data.frame
+   
+}) %>% Reduce(rbind,.)
+
+
+
+################################################################################
+#correct sample names from the original labeling into a correct one to account for sample duplications
+################################################################################
+simpleCache("all_parse_mappings_to_10xWT_actual_genotypes_sampleswap_corrected", {
+mapdf.gencorrected=lapply(names(allmaps), function(cond){
+ 
+  dd=lapply(allmaps[[cond]] %>% names, function(varr){
+    
+     tb=allmaps[[cond]][[varr]] %>% dplyr::select( origin, condition,stage,parental,rep_num, !!sym(mapfun(varr)), !!sym(paste0(mapfun(varr),"_predicted.id.score"))) %>% filter(stage %in% includestages) %>% mutate(condition= gsub( "cMYCN","cWTMYCN", condition))
+    sta= tb %>% pull(stage) %>% unique 
+    condd= tb %>% pull(condition) %>% unique 
+    parenta= tb %>% pull(parental) %>% unique
+    
+    #list(sta, condd, parenta)
+    adapt.rep=Vectorize(function(oldgen, newgen, repp){
+      if(oldgen!= newgen){
+       paste0(repp, "n") 
+      }else{
+        repp
+        }
+    }, USE.NAMES=F)
+    
+    
+    tb %>% mutate(actual.cgenotype= (gentable %>% filter(stage== sta, condition==!!condd, parental==!!parenta)) %>% pull(actual.cgenotype) %>% unique) %>%  mutate(new_rep=adapt.rep(condition, actual.cgenotype, rep_num), metacondition=paste0(actual.cgenotype,"_", parental, ".", new_rep))
+    
+    
+  }) %>% Reduce(cbind, .)
+  
+  dd= dd[, !duplicated(colnames(dd))] %>% as.data.frame
+   
+}) %>% Reduce(rbind,.)
+}, assignToVar="mapdf.gencorrected", reload=T)
+
+
+```
+
+## Supplementary figure 8 b Glasswork plots mapping the parse datasets to the 10x wt dataset divided by condition coloured by stage
+
+```{r parseglassworks, fig.width=10, fig.height=10}
+
+library(concaveman)
+cts=cts %>% mutate(metacondition= paste0("parse", condition, parental))
+colorpoints="stage"
+downsample=1
+concavity=2
+hullpointsize=0.005
+linesize=0.15
+plotmeth="jitter"
+conds2=paste0("parse", conds)
+includestages= c("D9")
+rescalecells=NULL
+downsamplecells=2000
+varr="WT.clusters"
+glassworkplots=lapply(1:nrow(cts), function(numcond){
+
+  metacond=cts[numcond, "metacondition"] %>% as.character
+cond=cts[numcond, "condition" ] %>% as.character
+p= cts[numcond, "parental" ] %>% as.character
+
+mapcon= mapdf %>% filter(metacondition==!!metacond, stage %in% includestages) %>% mutate(ccondition=metacondition) %>% sample_n(downsamplecells)
+
+ccond=mapcon %>% pull(ccondition) %>% unique
+  
+destinyclusters=mapcon %>% group_by( !!sym(mapfun(varr))) %>% summarise(counts=n()) %>% as.data.frame %>% arrange(-counts)
+  
+  ##collect all the destinies of each cell in each  together
+  des=destinyclusters %>% mutate(tot= sum(counts), frac=counts/tot) %>% col2names(., mapfun(varr))
+
+
+  umapsma= umapdf(scwt, reduction=ur)
+  getclusterfrac=function(x) des[x, "frac"]
+  umapsma[[fillvar]]=NA
+  umapsma[[fillvar]]=sapply(umapsma %>% pull(varr), getclusterfrac) %>% unname
+
+  if(plotmeth=="jitter"){
+  ##############################################################################
+  # jittered points method
+  ##############################################################################
+    ############################################################################
+    # Construct a blank scaffold plot for the mapped cells to come on top
+    ############################################################################
+    
+    blankscaffoldplot=ggplot(umapsma, aes(x=!!sym(rk %>% paste0(., "1")), y=!!sym(rk %>% paste0(., "2"))))+geom_point_rast(color="white")+theme_classic()
+  
+  ##############################################################################
+  # construct point bubbles
+  ##############################################################################
+  
+    
+    polys<-clusterhullpoint(NULL, umap.df=umapscwt, clusvar=varr, query.df=mapcon %>% filter(ccondition==!!ccond), clus=umapscwt %>% pull(!!sym(varr)) %>% unique, fillvar="null", linecolor="#000000", colorpoints=colorpoints, size=linesize, pointsize=hullpointsize, reduction.key=rk, downsample=downsample, concavity=concavity, rescale.cells=rescalecells)
+  
+################################################################################
+# scaffold plot
+################################################################################
+    polys.scaffold<-clusterhull3(NULL, umap.df=umapscwt, clusvar=varr, clus=umapscwt %>% pull(!!sym(varr)) %>% unique, fillvar="null", linecolor="#000000", size=linesize, reduction.key=rk, concavity=concavity)
+    
+      sca=15
+
+tpng(path=params$plotpath, paste0("clusterhull_mapping_emptyhulls_clusterres", umapclusres),wi=w*sca, he=w*sca,  res=rr) 
+print(blankscaffoldplot+polys.scaffold+NoLegend()+NoAxes())
+dev.off()
+
+tpdf(path=params$plotpath, paste0("clusterhull_mapping_emptyhulls_clusterres", umapclusres),wi=pw*sca, he=pw*sca) 
+print(blankscaffoldplot+polys.scaffold+NoLegend()+NoAxes())
+dev.off()
+  
+  ############################################################################
+    # Assembling a list of all the components of the plot
+    ############################################################################
+    pl= append(list(blankscaffoldplot), polys) 
+    
+    if (colorpoints!="null" && colorpoints %in% names(allcolors)){
+      
+      pl=append(pl, scale_color_manual(values=allcolors[[colorpoints]]))
+    }else{
+      pl=append(pl, scale_color_manual(values=c(one="FFFFFF00")))
+    }
+    
+    ############################################################################
+    # go from a list of plots to one ggplot assembly
+    ############################################################################
+    plo=pl%>% Reduce('+', .) +
+    scale_fill_manual(values=c(one="white"))+
+    NoAxes()+NoLegend()+ggtitle(paste0(ccond," rescaled ", rescalecells))
+  
+}else{
+  
+  ##############################################################################
+  # real positions method
+  ##############################################################################   
+  if(plotmeth=="real"){
+  polys=clusterhull(NULL, umap.df=umapsma, clusvar=varr, clus=NULL, fillvar="null", linecolor="#000000", size=0.5, reduction.key=rk, fillcols="#FFFFFF00")
+  
+      polys2=clusterhull(NULL, umap.df=umapsma, clusvar=varr, clus=NULL, fillvar=varr, linecolor="#000000", size=0.5, reduction.key=rk, fillcols="#FFFFFF00")
+  
+    mapped.cells.umap=ggumap(so=scwt, umap.df=mapcon, colorby=mapfun(varr), labelby=mapfun(varr), reduction.key=rk , colorlist=allcolors)
+
+      plo=mapped.cells.umap+polys+NoAxes()+ggtitle(cond)
+      plo2=mapped.cells.umap+polys2+NoLegend()+NoAxes()+ggtitle(cond)
+      plo+plo2
+  }
+  
+sca=10
+    tpng(path=params$plotpath, paste_("UMAP_with_hullandpoints_", ccond, "to-WT_method_", plotmeth, "clusterby",varr, "resolution", rs, "colorpoints_by",colorpoints, "stages", paste0(includestages, collapse="-", "rescaled_", rescalecells)), wi=w*sca, he=w*sca, res=rr)
+    
+    
+    print(
+      plo
+    )
+    dev.off()
+    sca=10
+    plo
+    
+ } })
+
+gc()
+
+#reordering cell lines
+cts.neworder=c(7,12,8,6, 1, 9, 4, 5, 2,10,3,11)
+
+for(x in cts.neworder){
+sca=15
+cond=paste0("parse", cts[x, "condition"], "_", cts[x, "parental"])
+
+tpng(path=params$plotpath, paste0("clusterhull_mapping_", cond, "to_wt_by_", varr, "_coloredby", colorpoints, "clusterres", umapclusres, "stages", paste0(includestages, collapse="-"), "rescaledto_",rescalecells),wi=w*sca, he=w*sca,  res=rr) 
+print(glassworkplots[[x]])
+dev.off()
+}
+
+
+sca=20
+tpng(path=params$plotpath, paste0("clusterhullgrid_AllParse_to_wt_by_", varr, "_coloredby", colorpoints, "clusterres", umapclusres, "stages", paste0(includestages, collapse="-"), "rescaled", rescalecells),wi=w*sca, he=w*sca,  res=rr) 
+print(glassworkplots[cts.neworder] %>% Reduce('+', .))
+dev.off()
+
+
+sca=2
+tpdf(path=params$outpath, paste0("clusterhullgrid_AllParse_to_wt_by_", varr, "_coloredby", colorpoints, "clusterres", umapclusres, "stages", paste0(includestages, collapse="-"), "downsampled", downsamplecells),wi=pw*sca, he=pw*sca) 
+print(glassworkplots[cts.neworder] %>% Reduce('+', .))
+dev.off()
+```
+
+### Supplementary figure 8 d. grid showing the diversity or cells in each cluster for each parse condition
+
+```{r}
+varr.bubble="WT.clusters"
+downsamplecells.bubble=2000
+
+allmetaconds= mapdf.gencorrected %>% pull(metacondition) %>% unique %>% sort
+
+allmetaconds=c("cWT_H7.R4", 
+"cWT_H7.R5", "cWT_H9.R7",  "c17q1q_H7.R4", "c17q1q_H7.R4n", "c17q1q_H7.R5", "c17q1q_H7.R5n", 
+"c17q1q_H9.R7", "c17q1q_H9.R7n", "cWTm_H7.R6", "c17qm_H7.R6", "c17qMYCN_H7.R6", "cWTMYCN_H7.R6", "c17q1qMYCN_H7.R4", "c17q1qMYCN_H7.R5", 
+"c17q1qMYCN_H9.R7")
+dsmaps=lapply(1:length(allmetaconds), function(numcond){
+
+ 
+  metacond=allmetaconds[numcond]
+
+cond=strsplit(metacond, split="_")[[1]][1]
+ 
+
+p=((strsplit(metacond, split="_")[[1]][2] ) %>% strsplit(., split="\\."))[[1]][1]
+
+
+#NO DOWNSAMPLING
+mapcon0= mapdf.gencorrected %>% filter(metacondition==!!metacond, stage %in% includestages) %>% mutate(ccondition=metacondition)
+mapcon= mapcon0 %>% mutate(tot=nrow(mapcon0)) %>% group_by(metacondition, parental, condition, !!sym(mapfun(varr.bubble))) %>% summarise(freq=n()/nrow(mapcon0))
+
+mapcon
+}) %>% Reduce(rbind, .)
+
+
+clevs=allcolors[[varr.bubble]] %>% names %>% rev
+ggplot(dsmaps)+geom_point(aes(x=factor(metacondition, levels=allmetaconds), y=factor(!!sym(mapfun(varr.bubble)), levels=clevs ), color=!!sym(mapfun(varr.bubble))  , size=freq))+theme_classic()+rotatex(90)+scale_color_manual(values=allcolors[[varr.bubble]])
+
+longermat=dsmaps %>% pivot_wider(., id_cols = "metacondition", values_from="freq", names_from="mapfun_WT.clusters", values_fill=0) %>% as.data.frame %>% col2names(., "metacondition") %>% select(-metacondition) %>% t
+original.names=colnames(longermat)
+
+#absolute display limits of the heatmap
+maxx=.2
+
+br=seq(-maxx,maxx,.1)
+br2=seq(0,maxx,.02)
+
+ 
+colls.parse= viridis(length(br), option="D")
+
+anm0=original.names%>% as.data.frame %>% givecolnames(., nms="condition") %>% col2names(., "condition") 
+anm= anm0 %>% mutate(MYCNdox= grepl("MYCN", condition), has17q1q=grepl("17q1q|c17q$", condition), has17q=grepl("17q", condition, ignore.case=T), MYCNinsert=grepl("m", condition, ignore.case=T)) %>% select(has17q1q, has17q, MYCNdox, MYCNinsert)
+
+
+anocolors=list(has17q=c("TRUE"="#009400", "FALSE"="white"), MYCNdox=c("TRUE"="magenta", "FALSE"="white"), has17q1q=c("TRUE"="orange", "FALSE"="white"), MYCNinsert=c("TRUE"="dark red", "FALSE"="white"))
+
+
+fhm=ComplexHeatmap::pheatmap(longermat[intersect(rev(clevs),rownames(longermat)), original.names] 
+                             ,
+                             cluster_row=F,
+                             cluster_col=F, 
+                             col=colls.parse,
+                             breaks = br2,
+                             annotation_col=anm,
+                             annotation_colors=anocolors,
+                             )
+sca=.7
+tpdf(path=params$plotpath,"heatmap_parse_mappingfrequencies", wi=pw*sca*1.3, he=pw*sca*1.2)
+print(fhm)
+dev.off()
+
+```
+
+
+### Differential gene expression and marker analysis of cells from day 9 across the board, triaged into different wild type clusters
+
+```{r, fig_height}
+##get cts from above
+
+simpleCache("wtheatmap_clusterinfo_genes_lfct_1_numtop_250minrate0.5_2023-10-19seriationmethodseuratncells300", assignToVar="wtcellinfo", reload=T)
+
+wtmarkers= wtcellinfo$markerlist
+
+allmarkers=list()
+alltopmarkers=list()
+
+simpleCache("parse_samples_genotype_table_actualgenotypescorrected", assignToVar="gentable.filtered", reload=T)
+
+for(i in 1:nrow(gentable.filtered)){
+
+cond=(gentable.filtered %>% as.data.frame)[i, "actual.cgenotype"]
+  p= (gentable.filtered %>% as.data.frame)[i, "parental" ] %>% as.character
+
+ 
+simpleCache(paste0("so_parse_selected_processed", p, cond), assignToVar="so", reload=T)
+
+ percent.mt<- PercentageFeatureSet(so, pattern = "^MT-") %>% givecolnames(., nms="percent.mt")
+ so@meta.data= cbind(so@meta.data,  percent.mt)
+
+ mappedcells.df= mapdf.gencorrected %>% filter(actual.cgenotype==!!cond, parental==!!p, stage %in% includestages) 
+  mappedcells= mappedcells.df %>% rownames
+
+  cellintersect=intersect(mappedcells, so@meta.data %>% rownames)
+  so= so[, cellintersect ]
+  so@meta.data=cbind(so@meta.data, mappedcells.df[cellintersect,]) 
+  so@meta.data= so@meta.data[,!(so %>% metadata %>% colnames %>% duplicated)]
+ 
+ cluslabel=mapfun(clusvarname)
+ markers.var="WT.clusters"
+options(future.globals.maxSize = 2 * 10^9)
+fullreload=F; fullrecreate=T
+datte="2023-10-20" #chopstring(timestamp(""))
+verbose=F
+meth="deseq"
+groupvar="group1"
+pvar="padj"
+thresh=pval
+fcvar="log_fc"
+minrate=.5
+minfc=1
+predicted.id.thresh=0.6
+replicatecol="rep_num"
+pastedstages=paste0(includestages, collapse="-")
+
+
+so=seuratmarkers.delegate(filterps(so, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column=replicatecol, minfc=minfc, selecttop=selecttop, method=method.markers, getresidual=F, fullreload=F, fullrecreate=T, minrate=minrate)
+ 
+simpleCache(paste_("seurat_parse_mappedto10xWT", p, cond, pastedstages, "_with_mappedcellmarkers_delegate", datte), {
+  nm=paste0("parse",p,cond)
+fcat(paste0("finding markers using the DElegate package...\n") ) 
+
+simpleCache(paste_("markers_cellsmappedtoWT10x_parse_parental",p, "condition", cond, "stage", pastedstages, "on_clusters_of", cluslabel,"method", meth, datte), {
+  
+
+ 
+ so=seuratmarkers.delegate(filterps(so, varbl=markers.var, th=predicted.id.thresh), group_column=mapfun(markers.var), replicate_column=replicatecol, minfc=minfc, selecttop=selecttop, method=method.markers, getresidual=F, fullreload=F, fullrecreate=T, minrate=minrate)
+ 
+ so}, assignToVar="so", reload=T)
+ 
+ $RNA@misc$markers
+
+  
+}, assignToVar="m", reload=T, recreate=F)
+
+
+
+   clusters=m %>% pull(get(groupvar)) %>% unique %>% substr(., 2,5) %>% as.numeric %>% sort %>% paste0("C", .) 
+ ## arrange and filter best markers
+    
+  if(is.null(selecttop)){
+  lt=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc>=minfc) %>% arrange(log_fc))
+  topstr=""  
+}else{
+  lt=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc>=minfc) %>% arrange(log_fc) %>% head(n=selecttop))
+}
+
+     if(is.null(selectbottom)){
+  ltb=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc<=-minfc) %>% arrange(log_fc))
+  topstr=""  
+}else{
+  ltb=lapply(clusters, function(x) m %>% filter(group1==x,padj<=thresh, log_fc<=-minfc) %>% arrange(log_fc) %>% head(n=selecttop))
+}   
+  
+    mb=ltb %>% Reduce(rbind,.) %>% mutate(metacondition=metacond)
+    mp=lt %>% Reduce(rbind,.) %>% mutate(metacondition=metacond)
+    
+alltopmarkers[[metacond]]=mp
+allmarkers[[metacond]]=m
+
+cat("Number of filtered markers: ", nrow(mp), "(", (nrow(mp)/nrow(m))*100, "% markers post filtering)\n")
+so$RNA@misc$markers <- m
+so$RNA@misc$top_markers <- mp
+so$RNA@misc$bottom_markers <- mb
+cat("Dataset", nm, ": calculating residuals for missing genes in scale data...\n")
+so <- GetResidual(so, features = so$RNA@misc$top_markers$feature, verbose = F)
+}, assignToVar="so", reload=F, recreate=T)
+
+### compare how strong the WT marker signature is for the condition at hand.
+
+
+### collect and organise parse dataset cells and their markers
+simpleCache(paste_("cellinfo_parse_metacondition", metacond  ), {
+
+cellinfo.mappedcells= seriatecells(so, clusvar=mapfun(clusvarname), meth=smeth, clusters=clusters,groupvarname=groupvar,lfcvarname=fcvar, extended.output=T, deduped=T, ncells=500)
+cellinfo.mappedcells}, assignToVar="cellinfo.mappedcells", recreate=fullrecreate, reload=fullreload)
+
+ 
+}  
+```
+
+Adjust names of parse dataset samples after correction, for plotting
+Code for Supplementary figure 8 c
+
+```{r}
+mapdf.gc3=mapdf.gencorrected %>% mutate(pcondition=paste_(actual.cgenotype, parental))
+pconds=c("cWT_H7","cWT_H9",  "cWTm_H7","cWTMYCN_H7", "c17qm_H7", "c17qMYCN_H7",  "c17q1q_H7", 
+ "c17q1qMYCN_H7", "c17q1q_H9", "c17q1qMYCN_H9")
+allcolors[["pcondition"]] = randomcolors(length(pconds)) %>% givename(., pconds)
+
+
+
+sca=1
+tpdf(path=params$outpath, "transferplot_parse", wi=pw*sca*.85, he=pw*sca*1.3)
+transferplot(df=mapdf.gc3,so=NULL,  labelvars=c("mapfun_stage"), facetvar  ="pcondition", facet.ncol=1, facet.nrow=length(pconds), colorlist=allcolors)+scale_y_reverse()+coord_flip()
+dev.off()
+
+
+fwrite(mapdf.gc3, file=file.path(params$outpath, "parse_mapdf.csv"), row.names=T)
+```
+
+
+
+Heatmaps for markers of all the mapped cells in each condition
+```{r}
+
+for(i in 1:nrow(gentable.filtered)){
+p=gentable.filtered[i, "parental"] %>% as.character
+cond=gentable.filtered[i, "actual.cgenotype"] %>% as.character
+  
+selectedMeta <-  meta2 %>% filter(parental==p, actual.cgenotype==cond)
+print(selectedMeta)
+
+all.selected.meta[[i]]=selectedMeta
+
+## Basic processing
+
+#Read in Parse data (this part is quite fast):
+simpleCache(paste_("so_parse_selected_processed_mappedWTmarkers", p, cond), assignToVar="so", reload=T)
+            
+ci=allcellinfos[[i]]
+
+gtl= adjust.markers(ci, 3)$markers
+            
+allheatmaps[[i]]=cellinfo.heatmap(so, cellinfo = allcellinfos[[i]], genes.to.label = gtl, assay="SCT", return.everything=T, name=Project(so), colorlist=allcolors)            
+
+sca=1.6
+tpdf(path=params$plotpath, paste0("heatmap_", Project(so)), wi=pw*sca*1.3, he=pw*sca)
+allheatmaps[[i]]$heatmap
+dev.off()
+
+
+```
+
+
+Organising the information of all DE marker analyses inside "allcellinfos" and related objects.
+
+
+```{r}
+fullreload=F
+fullrecreate=T
+nums=c(1,2,3,7)
+all.cellinfos=lapply(nums, function(i){
+p=cts[i, "parental"] %>% as.character
+cond=cts[i, "condition"] %>% as.character
+metacond=cts[i, "metacondition"] %>% as.character  
+
+simpleCache(paste_("seurat_parse_mappedto10xWT", p, cond, pastedstages, "_with_mappedcellmarkers_delegate", datte), assignToVar="so", reload=T)
+
+simpleCache(paste_("cellinfo_parse_metacondition", metacond  ), {
+
+cellinfo.mappedcells= seriatecells(so, clusvar=mapfun(clusvarname), meth="signature", clusters=clusters,groupvarname=groupvar,lfcvarname=fcvar, extended.output=T, deduped=T, ncells=500)
+cellinfo.mappedcells}, assignToVar="cellinfo.mappedcells", recreate=fullrecreate, reload=fullreload)
+cellinfo.mappedcells
+}) %>% givename(., cts[nums, ]$metacondition %>% as.vector)
+
+refmarkers=all.cellinfos[["parsecWTH7"]]$markerlist
+all.wtclusters=all.cellinfos[["parsecWTH7"]]$markerlist %>% names
+all.genotypes= cts[nums, ]$metacondition %>% as.vector
+
+markermat= matrix(nrow=length(all.wtclusters), ncol=length(all.genotypes), data=NA)
+rownames(markermat)=all.wtclusters
+colnames(markermat)=all.genotypes
+
+for(cc in all.wtclusters){
+  for(gg in all.genotypes){
+    ccellinfo= all.cellinfos[[gg]]
+    if(is.null(ccellinfo$markerlist[[cc]]) ){
+      markermat[cc, gg]=NA
+    }else{
+      # calculating jaccard index of the markers of the wt vs the condition
+      markermat[cc, gg]= length(intersect(refmarkers[[cc]], ccellinfo$markerlist[[cc]]))/length(union(refmarkers[[cc]], ccellinfo$markerlist[[cc]]))
+    }
+      
+  }}
+
+
+ComplexHeatmap::pheatmap(markermat, cluster_row=F, cluster_col=F, scale="none", col=colorRampPalette(c("white", "red"), space="rgb")(20))
+
+
+
+
+```
+
+
+## Cross-comparing wild-type markers with with the cells mapped to the respective clusters. 
+In this block we order the cells based on the strength of their internal marker signature, rather than on the strength of the wt marker signature
+
+```{r fig.width=5, fig.height=6}
+topgenes=50
+maxcells=100
+ref.cellinfo=wtcellinfo
+
+all.wtclusters=all.cellinfos[["parsecWTH7"]]$markerlist %>% names
+all.genotypes= cts[nums, ]$metacondition %>% as.vector
+all.genotypes=all.genotypes[c(4,1,2,3)]
+
+
+
+markermat= matrix(nrow=length(all.wtclusters), ncol=length(all.genotypes), data=NA)
+rownames(markermat)=all.wtclusters
+colnames(markermat)=all.genotypes
+
+nums=c(1,2,3,7)
+
+#for(cc in all.wtclusters){
+  allmats=lapply(nums, function(i){
+    p=cts[i, "parental"] %>% as.character
+cond=cts[i, "condition"] %>% as.character
+metacond=cts[i, "metacondition"] %>% as.character 
+  
+    simpleCache(paste_("seurat_parse_mappedto10xWT", p, cond, pastedstages, "_with_mappedcellmarkers_delegate", datte), assignToVar="so", reload=T)
+
+
+  simpleCache(paste_("cellinfo_wtmarkers_parse_metacondition", metacond  ), {
+
+#cellinfo.mappedcells= seriatecells(so, clusvar=mapfun(clusvarname), meth="signature", clusters=clusters,groupvarname=groupvar,lfcvarname=fcvar, extended.output=T, deduped=T, ncells=500)
+
+cellinfo.mappedcells.wtmarkers= seriatecells2(so, clusvar=mapfun(clusvarname),markers=ref.cellinfo$markerlist, meth="seurat", groupvarname=groupvar,lfcvarname=fcvar, extended.output=T, deduped=T, ncells=500, groups.match.markers = T)
+
+cellinfo.mappedcells.wtmarkers}, assignToVar="ccellinfo", recreate=T)  
+  
+refmarkers=lapply(1:length(ccellinfo$markerlist), function(x){ 
+if(topgenes > length(ccellinfo$markerlist[[x]])){
+  ccellinfo$markerlist[[x]]}else{
+  ccellinfo$markerlist[[x]][1:topgenes]
+  }
+  
+  }) %>% Reduce(c, .)
+refmarker.clusreference=lapply(1:length(ccellinfo$markerlist), function(x){
+  if(topgenes > length(ccellinfo$markerlist[[x]])){
+  rep(names(ccellinfo$markerlist)[x], length(ccellinfo$markerlist[[x]]))
+  }else{
+  rep(names(ccellinfo$markerlist)[x], topgenes)  
+  }
+  }) %>% Reduce(c, .)   
+    
+#select only the top maxcells of each group  
+selectedcells.list= lapply(ccellinfo$cell.list, function(x) if(length(x)>=maxcells){x[(length(x)-maxcells):length(x)]}else{x}) 
+
+  selectedcells= lapply(ccellinfo$cell.list, function(x) if(length(x)>=maxcells){x[(length(x)-maxcells):length(x)]}else{x}) %>% Reduce(c, .)
+
+## get the groupings for each cell
+selectedcells.group=lapply(1:length(ccellinfo$cell.list), function(x) rep(names(ccellinfo$markerlist)[x], length(selectedcells.list[[x]]))) %>% Reduce(c, .) 
+
+################################################################################
+# generate matrices
+################################################################################
+
+    fullmat=join_meta_exp(so, genes= refmarkers, cells=selectedcells, assay=ass)
+ 
+    
+    foundgenes=intersect(colnames(fullmat), refmarkers)
+    logicalmat=(fullmat[,foundgenes ]>0) %>% t
+    genemat=(fullmat[,foundgenes ]) %>% t
+    #summarymat shows
+  summarymat= fullmat %>% names2col(., "cellid") %>% pivot_longer(., all_of(foundgenes), names_to="gene", values_to="expression") %>% mutate(isexpressed=expression>0) %>% group_by(!!sym(mapfun(clusvarname)), gene) %>% summarise(meanexp=mean(expression), percent.expressed=sum(isexpressed)/n()) 
+    
+    
+ggplot()+geom_point(data=summarymat, aes(y=gene, x=mapfun_WT.clusters, fill=percent.expressed, size=meanexp), shape=21, color="#FFFFFF00")
+  
+
+remove.zerorows= function(matt) matt[apply(matt, 1, sum)!=0,]
+get.nonzerorows= function(matt) (apply(matt, 1, sum)!=0) %>% unname
+
+mat=remove.zerorows(apply(genemat, c(1,2), na2zero))
+
+
+################################################################################
+# prepare annotation
+################################################################################
+annot.mappedcells=as.data.frame(selectedcells.group) %>% giverownames(., selectedcells) %>% givecolnames(.,ind=1, nms="WT.clusters") %>% mutate(WT.clusters= factor(WT.clusters, levels=allcolors[["WT.clusters"]] %>% names))
+annot.mappedgenes= refmarker.clusreference %>% as.data.frame %>% giverownames(., refmarkers) %>% givecolnames(.,ind=1, nms="WT.clusters") 
+
+annot.mappedgenes=annot.mappedgenes %>% names2col(., "gene") %>% filter(gene %in% rownames(mat)) %>% dplyr::select(WT.clusters) %>% mutate(WT.clusters= factor(WT.clusters, levels=allcolors[["WT.clusters"]] %>% names))
+
+geneguide=  1:nrow(annot.mappedgenes)
+names(geneguide)=annot.mappedgenes %>% rownames
+#marking where relevant genes are in the marker selection
+mrkrs=c("POU5F1", "NANOG", "FGF17","EGR1","BPI","KLF4", "TBXT", "MOXD1","HAND1", "ALK", "NEFM", "CNTNAP2","TFAP2B", "POSTN", "PLP1", "SOX10", "CRABP1",
+         "DLK1", "GAP43", "ERBB3", "PHOX2B", "ONECUT1", "ASCL1", "VIM",
+         "ELAVL4", "MSX2", "COL1A1", "TWIST1", "FN1", "GATA3", "TH", "DBH", "SIX1")
+ha = ComplexHeatmap::rowAnnotation(foo = ComplexHeatmap::anno_mark(at = geneguide[mrkrs], labels = mrkrs))
+
+################################################################################
+# plot heatmap
+################################################################################
+
+tpng(path=params$plotpath, paste0("pheatmap_wtseriation_mappedtowt_metacondition", metacond, "numtopgenes_",topgenes, "_numcells_",maxcells  ))
+hc=ComplexHeatmap::pheatmap(mat, 
+                         cluster_row=F, 
+                         cluster_col=F, 
+                         scale="row", 
+                         col=colls,
+                         breaks=br,
+                         gaps_row=annot.mappedgenes %>% pull("WT.clusters") %>% factor %>% as.numeric %>% diff %>% as.logical %>% which,
+                         gaps_col=(selectedcells.group %>% factor %>% as.numeric %>% diff %>% as.logical %>% which),
+                         show_rownames=F,
+                         show_colnames=F, 
+                         border_color = NA,
+                         main=metacond, 
+                         annotation_row=annot.mappedgenes,
+                         annotation_col=annot.mappedcells,
+                         annotation_colors=allcolors,
+                         right_annotation=ha
+                         )  
+print(hc)
+  dev.off()
+  
+#list()  
+  })
+
+    ccellinfo= all.cellinfos[[gg]]
+    if(is.null(ccellinfo$markerlist[[cc]]) ){
+      markermat[cc, gg]=NA
+    }else{
+      # calculating jaccard index of the markers of the wt vs the condition
+      markermat[cc, gg]= length(intersect(refmarkers[[cc]], ccellinfo$markerlist[[cc]]))/length(union(refmarkers[[cc]], ccellinfo$markerlist[[cc]]))
+    }
+      
+ # }}
+
+
+ComplexHeatmap::pheatmap(markermat, cluster_row=F, cluster_col=F, scale="none", col=colorRampPalette(c("white", "red"), space="rgb")(20))
+
+```
+
+## Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```

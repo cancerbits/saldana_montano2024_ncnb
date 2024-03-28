@@ -1,0 +1,119 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Additional plots and tables' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we export some additional tables (which will make up the
+supplementary tables of the paper).
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS_ANNOTATED)
+dA <- latestCache(CACHE_ATAC_META)
+dds <- latestCache(CACHE_ATAC_DDS)
+darRes <- latestCache(CACHE_ATAC_DDS_RES)
+geneAssignments <- latestCache(CACHE_ATAC_GENE_ASSIGNMENTS)
+genomeRegs <- latestCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "regions"))
+nbseRegs <- latestCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "nbse"))
+```
+
+
+
+
+
+# Count tables
+
+```{r count_tables}
+sampleOrder <- dA[order(factor(condition, levels=CONDITION_ORDER), factor(day, levels=DAY_ORDER)), library_name]
+setkey(dA, library_name)
+
+tbl <- SummarizedExperiment::assay(DESeq2::vst(dds))[as.character(peaksDt$rid),sampleOrder]
+fwrite(tbl, file=resultsDir("atac_count_norm.csv.gz"))
+
+tbl <- DESeq2::counts(dds)[as.character(peaksDt$rid),sampleOrder]
+fwrite(tbl, file=resultsDir("atac_count_raw.csv.gz"))
+```
+
+
+# Supplementary tables
+
+Gene assignments per peak (to be added to other tables):  
+
+```{r gene_assgns}
+tblG <- geneAssignments$promo_or_sigcor[,.(genes=paste(unique(gene_symbol), collapse=",")),by=rid]
+print(head(tblG))
+```
+
+
+Peak coordinates and annotations:
+
+```{r peaks}
+for(n in names(genomeRegs)) {
+  tmp <- as.data.table(reshape2::melt(genomeRegs[[n]]))
+  tmp <- tmp[!is.na(value) & !is.na(L2), .(term = paste(L2, collapse=",")), by=value]
+  peaksDt[tmp$value, gsub("regions_","",n) := tmp$term]
+  peaksDt[is.na(get(gsub("regions_","",n))), gsub("regions_","",n) := "Unannotated"]
+}
+for(n in names(nbseRegs)) {
+  tmp <- as.data.table(reshape2::melt(nbseRegs[[n]]))
+  tmp <- tmp[!is.na(value)  & !is.na(L2), .(term = paste(L2, collapse=",")), by=value]
+  peaksDt[tmp$value, gsub("se_","",n) := tmp$term]
+  peaksDt[is.na(get(gsub("se_","",n))), gsub("se_","",n) := "Unannotated"]
+}
+
+tbl <- merge(peaksDt[, .(rid, chrom, start, end, module_id = all_mods_id, dhs_type, catlas_type, enhatlas_type, chromhmm_type, vg2017_type, bo2017_type, ga2020top_type, `17q_up`, `17q_down`, `17q1q_up`, `17q1q_down`, `17q1qMYCN_up`, `17q1qMYCN_down`)], tblG, all.x=TRUE, by="rid")
+fwrite(tbl, file=resultsDir("tbl_atac_peaks.csv.gz")) # == GSE219151_peak_annot.csv.gz
+fwrite(tbl, file=resultsDir("../figures/supp_tbl_atac_peaks.csv")) 
+
+print(head(tbl))
+```
+
+Differential analysis results:
+
+```{r diff}
+tbl <- darRes[sig==TRUE,][order(cmp, log2FoldChange), .(cmp=cmp, stratum=stratum, fg=fg, bg=bg, rid, base_mean=sprintf("%.2f", baseMean), lfc=sprintf("%.2f", log2FoldChange), lfc_se=sprintf("%.2f", lfcSE), stat=sprintf("%.2f", stat), pval=sprintf("%.3f", pvalue), padj=sprintf("%.3f", padj))]
+tbl <- merge(tbl, tblG, all.x=TRUE, by="rid")
+fwrite(tbl, file=resultsDir("tbl_atac_dars.csv.gz"))
+fwrite(tbl, file=resultsDir("../figures/supp_tbl_atac_dars.csv"))
+
+print(head(tbl))
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

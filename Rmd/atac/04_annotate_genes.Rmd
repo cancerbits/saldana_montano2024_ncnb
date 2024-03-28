@@ -1,0 +1,257 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Annotation and enrichment analysis' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we associate ATAC-seq regions with genes (by proximity and correlation), and use this association to link the markers of cell clusters (-> scRNA-seq analysis) with the ATAC-seq peaks.
+This information is not directly displayed in the paper figures, but it is used later for enrichment analysis and gene-regulatory network construction.
+
+All `*_annotate_*.Rmd` notebooks compile metadata for the ATAC-seq peaks peaks which are then used in `08_enrichments.Rmd`.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(patchwork)
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS)
+geneAnnot <- latestCache(CACHE_GENE_ANNOT)
+scAgg <- latestCache(CACHE_SCRNA_DATA_AGGREGATED)
+scMarkers <- latestCache(CACHE_SCRNA_MARKERS)
+dA <- latestCache(CACHE_ATAC_META)
+dds <- latestCache(CACHE_ATAC_DDS)
+d <- SummarizedExperiment::assay(DESeq2::vst(dds))
+```
+
+
+# Load gene annotations
+
+```{r constants}
+MAX_DIST_GENE <- 250000
+GENELIST_MIN_GENES <- 3
+GENE_ASSOC_SIGCOR_THRESH <- 0.05
+```
+
+Select gene annotations:
+
+```{r select_gene_annot}
+selGeneAnnot <- geneAnnot[(as.character(seqnames(geneAnnot)) %in% peaksDt[,unique(chrom)]) & geneAnnot$type=="gene" & geneAnnot$gene_type=="protein_coding",]
+selExonAnnot <- geneAnnot[(as.character(seqnames(geneAnnot)) %in% peaksDt[,unique(chrom)]) & geneAnnot$type=="exon" & geneAnnot$gene_type=="protein_coding",]
+```
+
+
+# Associate peaks with genes
+
+## Calculatate expression-accessibility correlation
+
+Calculate peak-gene correlations (based on ATAC-seq vs. scRNA-seq) with real vs. shuffled peak-gene pairs. We use correlation to identify peak-gene pairs that have a higher-than-expected correlation and might potentially be linked.
+
+```{r chrom_expr_merge}
+dMerge <- versionedCache("chrom_expr_merge", instruction={
+	dExpr <- melt(as.data.table(expr_data, keep.rownames="gene_symbol"), variable.name="library_name", id.vars="gene_symbol")
+
+	dChrom <- melt(as.data.table(atac_data, keep.rownames="rid"), variable.name="library_name", id.vars="rid")
+
+	peaksGr <- dtToGr(peaks_dt[rid%in%dChrom$rid,], metaCols="rid")
+
+	# all peaks vs all TSS distances:
+	allGeneDist <- rblapply(1:length(sel_gene_annot), function(i) data.table(rid=peaksGr$rid, gene_dist=distance(peaksGr, promoters(sel_gene_annot, 0, 1)[i,], ignore.strand=T))[!is.na(gene_dist),], "tss_index", cores=8)
+	allGeneDist <- allGeneDist[gene_dist<=max_dist,]
+	allGeneDist[, gene_symbol:=sel_gene_annot@elementMetadata$gene_name[as.numeric(tss_index)], by=tss_index]
+	allGeneDist[, tss_index:=NULL]
+
+	# first add chromatin then expression data on both ends of the mapping:
+	dMerge <- merge(dChrom, allGeneDist, by="rid", allow.cartesian=T)
+	dMerge <- merge(dExpr, dMerge[,.(rid, library_name, value, gene_symbol, gene_dist)], by=c("library_name","gene_symbol"), suffixes=c("_gex","_chrom"), allow.cartesian=TRUE)
+	
+	return(dMerge)
+}, buildEnvir=list(
+  max_dist=MAX_DIST_GENE,
+  expr_data=scAgg,
+  atac_data=d,
+  peaks_dt=peaksDt[, .(rid, chrom, start, end)],
+  sel_gene_annot=selGeneAnnot
+))
+```
+Shuffled correlation values:
+
+```{r shuffled_correlations}
+dShuffleCors <- versionedCache("chrom_expr_merge_shuffle", instruction={
+	nIter <- 10
+	dShuffleCors <- rblapply(1:nIter, function(iter) {
+		msgF("iter=%d",iter)
+		d_merge[, .(pearson=cor(value_gex, sample(value_chrom))), by=.(rid, gene_dist, gene_symbol)]
+	}, "iter", cores=min(10, nIter))
+	return(dShuffleCors[is.finite(pearson),])
+}, buildEnvir=list(
+  d_merge=dMerge
+))
+```
+Real collection values:
+
+```{r merged_corrlations}
+dMergeCor <- versionedCache("chrom_expr_merge_cor", instruction={
+	dMergeCor <- d_merge[, .(pearson=cor(value_gex, value_chrom)), by=.(rid, gene_dist, gene_symbol)]
+	return(dMergeCor[is.finite(pearson),])
+}, buildEnvir=list(
+  d_merge=dMerge
+))
+```
+	
+```{r shuffle_merge_plot}
+dShuffleCors[, cor_score := exp(1-(pearson)) * log10(gene_dist+1000)]
+dMergeCor[, cor_score := exp(1-(pearson)) * log10(gene_dist+1000)]
+rm(dMerge)
+```
+
+## Assign peaks to genes
+
+Define different functions for assigning peaks to genes:
+
+```{r gene_assgn_strategies}
+geneAssignmentStrategies <- list(
+	# assign peak to closest gene by peak-to-TSS distance (within max. distance):
+	closest_tss = function(gr, gene_annot=selGeneAnnot, window_size=MAX_DIST_GENE) {	
+		tss <- promoters(gene_annot, 0, 1)
+		assoc <- as.data.table(GenomicRanges::distanceToNearest(gr, tss, ignore.strand=T))
+		assoc <- assoc[, .(gr_index=queryHits, gene_symbol=tss@elementMetadata$gene_name[subjectHits], gene_dist=distance)]
+		return(assoc[gene_dist<=window_size,])	
+	},
+	# assign peaks to all genes with "significant correlation" (within max. distance):
+	sigcor = function(gr, gene_annot=selGeneAnnot, pos_cor_only=TRUE, pthresh=GENE_ASSOC_SIGCOR_THRESH, window_size=MAX_DIST_GENE, shuffle_cor=dShuffleCors, merge_cor=dMergeCor) {
+		fn <- abs
+		if(pos_cor_only) fn <- identity
+	
+		shuffle_cor <- shuffle_cor[rid%in%gr$rid & gene_symbol%in%gene_annot@elementMetadata$gene_name,]
+		merge_cor <- merge_cor[rid%in%gr$rid & gene_symbol%in%gene_annot@elementMetadata$gene_name,]
+	
+		minCor <- as.numeric(round(shuffle_cor[is.finite(pearson),quantile(fn(pearson), 1-pthresh, na.rm=T)],1))
+		msg(minCor)
+		
+		return(merge_cor[fn(pearson)>=minCor, .(gr_index=structure(1:length(gr), names=gr$rid)[rid], gene_symbol, gene_dist)])
+	},
+	# assign peaks to genes with overlapping promoters:
+	promo = function(gr, gene_annot=selGeneAnnot, prox_width=5000) {
+		promos <- GenomicRanges::promoters(gene_annot)
+		assoc <- as.data.table(GenomicRanges::findOverlaps(gr, promos, ignore.strand=T))
+		assoc[, gene_dist:= GenomicRanges::distance(gr[queryHits], promos[subjectHits])]
+		assoc <- assoc[, .(gr_index=queryHits, gene_symbol=promos@elementMetadata$gene_name[subjectHits], gene_dist)]
+		return(assoc)	
+	},
+	# assign peaks to genes with "significant correlation" or with overlapping promoter:
+	promo_or_sigcor = function(gr, gene_annot=selGeneAnnot, pos_cor_only=TRUE, pthresh=GENE_ASSOC_SIGCOR_THRESH, window_size=MAX_DIST_GENE, shuffle_cor=dShuffleCors, merge_cor=dMergeCor) {
+		sigRes <- geneAssignmentStrategies$sigcor(gr, gene_annot=gene_annot, pos_cor_only=pos_cor_only, pthresh=pthresh, window_size=window_size, shuffle_cor=shuffle_cor, merge_cor=merge_cor)
+		promoRes <- geneAssignmentStrategies$promo(gr, gene_annot=gene_annot)
+		
+		return(unique(rbind(sigRes, promoRes)[,.(gene_dist=min(gene_dist)),by=.(gr_index, gene_symbol)]))
+	}
+)
+```
+
+Carry out gene assignments:
+
+```{r do_gene_assignments}
+geneAssignments <- versionedCache(CACHE_ATAC_GENE_ASSIGNMENTS, instruction={
+	geneAssignments <- sapply(names(assgn_strategies), function(asgn) {
+		msg(asgn)
+		assgn_strategies[[asgn]](dtToGr(peaks_dt,metaCols="rid"))
+	}, simplify=FALSE)
+	geneAssignments <- sapply(geneAssignments, function(asgn) asgn[, rid:=peaksDt$rid[gr_index]], simplify=FALSE)
+	return(geneAssignments)
+}, buildEnvir=list(
+  assgn_strategies=geneAssignmentStrategies,
+  peaks_dt=peaksDt[,.(chrom,start,end,rid)],
+  shuffle_cor=dShuffleCors,
+  merge_cor=dMergeCor
+))
+
+print(sapply(geneAssignments, function(x) x[,.(rids=length(unique(rid)), genes=length(unique(gene_symbol)))]))
+```
+
+
+# Gene-based annotations
+
+Use scRNA-seq cluster markers and remember in the list of databases to be used for enrichment analyses:
+
+```{r save_gene_sets}
+db <- versionedCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "genes"), instruction={
+    
+  matchGenesets <- function(genesetsDT, geneAssignments, prefix) {
+  	unlist(sapply(names(geneAssignments), function(asgn) {
+  
+  		allAnnotGenes <- geneAssignments[[asgn]][,sort(unique(gene_symbol))]
+  		gs <- genesetsDT[gene_symbol%in%allAnnotGenes, ]
+  		
+  		gs <- split(gs, by="L1")
+  		
+  		gs <- sapply(gs, function(gs) {
+  			univ <- gs[,unique(gene_symbol)]
+  			
+  			# make a function that assigns gene symbols to given region IDs (using closure to make this work outside this loop):
+  			fn <- function(asgn, genes) {
+  				return(function(rids) {
+  					geneAssignments[[asgn]][rid%in%rids & gene_symbol%in%genes, unique(gene_symbol)]
+  				})
+  			}
+  			
+  			return(list(
+  				lists = split(gs$gene_symbol, f=gs$L2),
+  				univ = univ,
+  				assign_fun = fn(asgn, univ)
+  			))
+  		}, simplify=F)
+  
+  		names(gs) <- paste_(prefix, names(gs))
+  
+  		return(gs)
+  	}, simplify=FALSE), recursive=FALSE, use.names=TRUE)
+  }
+  
+	genesetsDT <- rbind(sc_markers[,.(gene_symbol, L1=cmp, L2=cluster_id)], unique(sc_markers[,.(gene_symbol, L1="all", L2="all")]))
+	matchGenesets(genesetsDT, gene_assignments, "degs") 
+}, buildEnvir=list(
+  sc_markers=scMarkers,
+  gene_assignments=geneAssignments
+))
+
+print(sapply(db, function(x) sapply(x$lists,length)))
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

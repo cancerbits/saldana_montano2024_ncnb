@@ -1,0 +1,622 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Differential accessibility analysis and modules' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we perform differential accessibility analyses between different developmental stages and different conditions (cell lines) and then group the identified differentially accessibile regions into "chromatin modules".
+These analyses directly feed into Fig 9a and Supplementary Figs. 12a-c of the paper.
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(DESeq2)
+```
+
+Functions / constants specifically used in this notebook.
+
+```{r def_func}
+prepHeatmapData <- function(d, do_scale=TRUE, do_cap=abscap) {
+	hmData <- d
+	dn <- dimnames(hmData)	
+	if(do_scale==TRUE) hmData <- t(apply(hmData, 1, scale))
+	dimnames(hmData) <- dn
+	do_cap(hmData)
+}
+
+plotHMorder <- function(d, row_cols, n, row_lbls, dist_meth="euclidean", clust_meth="complete", do_cap=abscap, do_scale=TRUE, rc=NULL, show_colnames=FALSE, annot_cols=c("condition", "day_fac"), row_annot=peaksDt, cellwidth=8, col_annot=dA,...) {		
+	hmData <- prepHeatmapData(d, do_scale=do_scale, do_cap=do_cap)
+	
+	hmCol <- c("white", "#EEEEEE", "black") 
+	if(do_scale) hmCol <- rev(RColorBrewer::brewer.pal(9, "RdBu"))
+	
+	addCuts <- F
+	if(is.null(rc)) {
+		rc <- fastcluster::hclust(dist(hmData, method=dist_meth), clust_meth)
+		addCuts <- T
+	}
+
+	o <- col_annot[colnames(hmData),][order(factor(condition, levels=CONDITION_ORDER), day_fac, batch), library_name]
+	hmData <- hmData[,o]
+	
+	colAnnot <- dtToDf(col_annot[colnames(hmData),unique(c("library_name",annot_cols)),with=F]) #, batch, lane
+	rowAnnot <- dtToDf(row_annot[rownames(hmData),intersect(c("rid", "module_id", row_cols),colnames(peaksDt)),with=F])
+				
+	if(addCuts) {
+		for(k in c(3:12)) {
+			x <- cutree(rc, k)
+			rowAnnot[, paste_("cut",k)] <- paste0("xyz",x)
+		}
+	}
+				
+	p <- ComplexHeatmap::pheatmap(hmData, 
+					col=hmCol, 
+					cellwidth=cellwidth,
+					gaps_col=col_annot[colnames(hmData),cumsum(table(factor(condition,levels=CONDITION_ORDER)))], 
+					border_color=NA, 
+					row_labels=row_lbls, 
+					show_colnames=show_colnames, show_rownames=T, 
+					use_raster=T, raster_resize_mat=F, raster_device="CairoPNG", raster_by_magick=F, 
+					main=n, 
+					cluster_col=FALSE, cluster_row=rc, 
+					annotation_col=colAnnot, 
+					annotation_row=rowAnnot, 
+					annotation_colors=COLOR_PALETTES, 
+					...)
+	
+	p
+}
+
+ATAC_P_THRESH <- 0.005
+ATAC_LFC_THRESH <- log2(1.5) 
+ATAC_DIST_METH <- "euclidean" 
+ATAC_CLUST_METH <- "ward.D2"
+BG_NAME <- "BG"
+```
+
+Load required input data from previous steps:
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS)
+dA <- latestCache(CACHE_ATAC_META)
+dds <- latestCache(CACHE_ATAC_DDS)
+d <- SummarizedExperiment::assay(DESeq2::vst(dds))
+```
+
+
+
+# Differential aceessibility
+
+## Run differential tests
+
+Use the pre-defined DESeq2 models to perform pair-wise comparisons between different conditions (cell lines) at the same day, or between developmental stages of the same conditon.
+
+```{r run_differential_tests}
+darRes <- versionedCache(CACHE_ATAC_DDS_RES, instruction={
+	# extract the DESeq2 results for a given comparison:
+	runDiffTest <- function(dds, cont) {
+		if(length(cont)!=3) return(NULL)
+		res <- as.data.table(DESeq2::results(dds, 
+		                                     contrast=cont, 
+		                                     pAdjustMethod="BH", 
+		                                     lfcThreshold=lfcThresh, 
+		                                     independentFiltering=FALSE, 
+		                                     format="DataFrame", 
+		                                     alpha=pThresh, 
+		                                     tidy=TRUE))
+		return(res)
+	}	
+	
+	grpVar <- "sample_group"
+	res <- data.table()
+	
+	# compile results for two types of comparisons:
+
+	# (i) condition X vs Y, stratified by timepoint		
+	tmp <- rblapply(dayOrder, function(strat) { 	
+			rblapply(conditionOrder, function(bg) {
+				bgGrp <- annot[day_fac==strat & condition==bg, unique(get(grpVar))]		
+				rblapply(setdiff(conditionOrder, bg), function(fg) { 
+					fgGrp <- annot[day_fac==strat & condition==fg, unique(get(grpVar))]
+					if(length(fgGrp)==0 | length(bgGrp)==0) return(NULL) # note: no +dox at D0 & D3						
+					msgF("\tstratum %s:\t%s vs %s", strat, paste0(fgGrp, collapse="+"), paste0(bgGrp, collapse="+"))
+					cont <- c(grpVar, fgGrp, bgGrp)	
+					res <- runDiffTest(dds, cont)
+					if(!is.null(res)) cbind(res, type="conds")
+				}, "fg")
+			}, "bg")
+		}, "stratum", cores=4)
+	res <- rbind(tmp, res, use.names=T)
+	
+	# (ii) all pairwise, stratified by condition:		
+	tmp <- rblapply(conditionOrder, function(strat) {		
+			rblapply(dayOrder, function(fgI) { 
+				rblapply(setdiff(dayOrder, fgI), function(bgI) { 
+					bg <- annot[day_fac==bgI & condition==strat, unique(get(grpVar))]			
+					fg <- annot[day_fac==fgI & condition==strat, unique(get(grpVar))]
+					msgF("stratum %s:\t%s (%s) vs %s (%s)", strat, fgI, paste0(fg, collapse="+"), bgI, paste0(bg, collapse="+"))
+					cont <- c(grpVar, fg, bg)			
+					res <- runDiffTest(dds, cont)
+					if(!is.null(res)) cbind(res, type="pairwise")
+				}, "bg")				
+			}, "fg")
+		}, "stratum", cores=4)
+	res <- rbind(tmp, res, use.names=T)
+		
+	res <- unique(res)		
+	
+	# some cosmetics:
+	res[, `rid` := row]
+	res[, `row` := NULL] 	
+	res[, `dir` := sign(log2FoldChange)]
+	res[, `cmp` := sprintf("%s|%s_vs_%s",stratum,fg,bg)]
+
+  # define significant DARs:
+  res[, sig:= is.finite(padj) & padj<=pThresh & abs(log2FoldChange)>=lfcThresh]
+
+	return(res)
+}, buildEnvir=list(
+  dds=dds,
+  dayOrder=DAY_ORDER,
+  conditionOrder=CONDITION_ORDER,
+  pThresh=ATAC_P_THRESH,
+  lfcThresh=ATAC_LFC_THRESH,
+  annot=dA[, .(day_fac, condition, library_name, sample_group)]
+))
+
+print(darRes[,.(N=sum(sig), perc=sum(sig)/.N),by=.(stratum, fg, bg)])
+print(darRes[sig==T,.(N=length(unique(rid)))][, .(n_sig=N, n_ns=nrow(peaksDt)-N)])
+```
+
+Add DAR information to main peak annotation table:
+
+```{r extend_dar_info}
+tmp <- dcast(darRes[sig==T,], rid~cmp, value.var="sig", fun.aggregate=function(x) !is.null(x) & length(x)>0)
+darCols <- colnames(tmp)[-1]
+forEach(darCols, function(n) suppressWarnings(peaksDt[, paste(n):=NULL]))
+peaksDt <- merge(peaksDt, tmp[,c("rid",darCols), with=F], by="rid", all.x=T)
+forEach(darCols, function(n) peaksDt[, paste(n) := !is.na(get(n)) & get(n)])
+peaksDt[, sig:=rowSums(.SD[,darCols,with=FALSE], na.rm=T)>0] # significant in at least one comparison?
+rm(tmp)
+```
+
+
+
+## Define region sets of interest
+
+We define set of peaks for consideration in enrichment analyses and plots annotations, e.g., for all DARs in a particular condition.
+
+```{r def_rois_1}
+regionSetsOfInterest <- c()
+mrg <- merge(peaksDt, darRes[sig==T,], by="rid")
+```
+
+
+Add ROIs for all up-regulated DARs per condition (across all stages):
+
+```{r def_rois_2}
+tmp <- sapply(darCols, function(darCol) {
+	dtToGr(mrg[cmp==darCol & dir>0,], metaCols=c("rid"))
+})
+names(tmp) <- paste_(names(tmp), "up")
+regionSetsOfInterest[names(tmp)] <- tmp
+```
+
+Add ROIs for all down-regulated DARs per condition (across all stages):
+
+```{r def_rois_3}
+tmp <- sapply(darCols, function(darCol) {
+	dtToGr(mrg[cmp==darCol & dir<0,], metaCols=c("rid"))
+})
+names(tmp) <- paste_(names(tmp), "down")
+regionSetsOfInterest[names(tmp)] <- tmp
+```
+
+Add ROIs for all DARs per condition:
+
+```{r def_rois_4}
+tmp <- sapply(2:length(CONDITION_ORDER), function(condI) {
+	fg <- CONDITION_ORDER[condI]
+	bg <- CONDITION_ORDER[1] # or vs prev condition?  
+	selCmps <- grep(paste_(fg,"vs", bg,"(up|down)"), names(regionSetsOfInterest), value=T)
+	unique(unlist(GenomicRanges::GRangesList(regionSetsOfInterest[selCmps]), use.names=F))
+}, simplify=FALSE)
+names(tmp) <- CONDITION_ORDER[-1]
+regionSetsOfInterest[names(tmp)] <- tmp
+peaksDt <- merge(peaksDt, dcast(rblapply(tmp, function(x) data.table(rid=x$rid)), rid~id), by="rid", all.x=TRUE)
+forEach(names(tmp), function(x) {
+	peaksDt[, (x):=!is.na(get(x))]
+})
+```
+
+Up DARS compared to WT:
+
+```{r def_rois_5}
+for(curDir in c("up","down")) {
+	tmp <- sapply(2:length(CONDITION_ORDER), function(condI) {
+		fg <- CONDITION_ORDER[condI]
+		bg <- CONDITION_ORDER[1] # vs WT
+		selCmps <- grep(paste_(fg,"vs",bg,curDir), names(regionSetsOfInterest), value=T)
+		unique(unlist(GenomicRanges::GRangesList(regionSetsOfInterest[selCmps]), use.names=F))
+	}, simplify=FALSE)
+	names(tmp) <- paste_(CONDITION_ORDER[-1],curDir)
+	regionSetsOfInterest[names(tmp)] <- tmp
+	suppressWarnings(forEach(names(tmp), function(x) peaksDt[, (x):=NULL]))
+	peaksDt <- merge(peaksDt, dcast(rblapply(tmp, function(x) data.table(rid=x$rid)), rid~id), by="rid", all.x=TRUE)
+	forEach(names(tmp), function(x) {
+		peaksDt[, (x):=!is.na(get(x))]
+	})
+}
+```
+Add "background" ROI, i.e. all peaks:
+
+```{r def_rois_6}
+regionUniv <- dtToGr(peaksDt, metaCols=c("rid"))
+names(regionUniv) <- peaksDt[,rid]
+regionSetsOfInterest[[BG_NAME]] <- regionUniv
+```
+
+
+
+## Overview of DAR results
+
+Export tables:
+
+```{r export_tabs}
+print(darRes[sig==T,.N,by=.(cmp,dir)])
+fwrite(darRes[sig==T,.N,by=.(type,fg,bg,cmp,dir)], file=resultsDir("dar_numbers.csv"))
+```
+
+Summarize number of DARs for different comparisons:
+
+```{r prep_dar_overview}
+hmData <- sapply(CONDITION_ORDER, function(cond) {
+	dtToDf(dcast(darRes[stratum==cond & type=="pairwise",.(sig=any(sig)),by=.(rid,bg,fg)][,.(N=sum(sig)), by=.(bg,fg)], bg~fg, value.var="N"))
+}, simplify=F)
+names(hmData) <- paste_("pairwise",names(hmData))
+hmData <- c(hmData, list(
+	conds_vs_wt = dtToDf(dcast(darRes[sig==TRUE & type=="conds" & bg=="WT",.(sig=any(sig)),by=.(rid,stratum,fg)][,.(N=sum(sig)), by=.(stratum,fg)], fg~stratum, value.var="N")),
+	conds_vs_17q = dtToDf(dcast(darRes[sig==TRUE & type=="conds" & bg=="17q",.(sig=any(sig)),by=.(rid,stratum,fg)][,.(N=sum(sig)), by=.(stratum,fg)], fg~stratum, value.var="N")),
+	conds_vs_17q1q = dtToDf(dcast(darRes[sig==TRUE & type=="conds" & bg=="17q1q",.(sig=any(sig)),by=.(rid,stratum,fg)][,.(N=sum(sig)), by=.(stratum,fg)], fg~stratum, value.var="N"))
+))
+```
+
+Make heatmaps:
+
+```{r heatmap_dar_overview, fig.width=12}
+pList <- NULL
+xcols <- function(d, rows, cols) {	
+	for(n in setdiff(cols,colnames(d))) d[,n] <- rep(NA,nrow(d))
+	for(n in setdiff(rows,rownames(d))) d[n,] <- rep(NA,ncol(d))	
+	return(as.matrix(d[rows,cols]))
+}
+forEach(grep("pairwise",names(hmData),value=T), function(n) {
+	hmDataX <- xcols(hmData[[n]], DAY_ORDER, DAY_ORDER)	
+	hmDataS <- apply(hmDataX, 2, prettyIntegers)
+	hmDataS[hmDataS=="NA"] <- ""
+	p <- ComplexHeatmap::pheatmap(log10(hmDataX+1), scale="none", breaks=seq(0,ceiling(log10(max(unlist(hmData), na.rm=T)+1)),length.out=21), col=viridis::magma(9), cellwidth=24, cellheight=12, border_color="white", main=n, cluster_col=F, cluster_row=F, display_numbers=hmDataS, number_format="%s", number_color="black")
+	pList <<- pList + p
+})
+# plot heatmaps next to each other:
+ComplexHeatmap::draw(pList)
+```
+
+```{r heatmap_dar_overview_2, fig.width=8}
+pList <- NULL
+forEach(grep("pairwise",names(hmData),invert=T, value=T), function(n) {
+	hmDataX <- xcols(hmData[[n]], CONDITION_ORDER, DAY_ORDER)	
+	hmDataS <- apply(hmDataX, 2, prettyIntegers)
+	hmDataS[hmDataS=="NA"] <- ""
+	p <- ComplexHeatmap::pheatmap(log10(hmDataX+1), scale="none", breaks=seq(0,ceiling(log10(max(unlist(hmData), na.rm=T)+1)),length.out=21), col=viridis::magma(9), cellwidth=24, cellheight=12, border_color="white", main=n, cluster_col=F, cluster_row=F, display_numbers=hmDataS, number_format="%s", number_color="black")
+	pList <<- pList + p
+})
+# plot heatmaps next to each other:
+ComplexHeatmap::draw(pList)
+```
+
+
+## Definition of chromatin modules
+
+### 1. Region modules R1-R6 = differential during WT differentiation
+
+```{r atac_modules_1}
+# use all samples for module definition:
+moduleSamples <- dA[, library_name]
+# ... and all regions found significant in at least one wild-type comparison:
+moduleRegs <- darRes[type=="pairwise" & sig==T, unique(rid)] 
+K <- 6
+
+tmp <- versionedCache("atac_modules", instruction={		
+
+	hmData <- prepHeatmapData(input_data[module_regs, module_samples], do_scale=TRUE)
+
+	# * calculate distance matrix and perform clustering:
+	distMat <- dist(hmData, method=dist_meth)
+	rc <- fastcluster::hclust(distMat, clust_meth)
+	
+	return(list(hm_data=hmData, row_clust=rc))
+	
+}, buildEnvir=list(
+  input_data=d, module_regs=moduleRegs, module_samples=moduleSamples, dist_meth=ATAC_DIST_METH, clust_meth=ATAC_CLUST_METH
+))
+```
+
+Assign each DAR to one of those "modules":
+
+```{r atac_modules_2}
+peaksDt[, module_id_tmp:=paste0("tmp",cutree(tmp$row_clust, k=K)[rid])]
+setkey(peaksDt, rid)
+```
+
+Figure out an order of region modules that puts the modules in roughly temporal order:
+
+```{r atac_modules_3}
+darOrderTmp <- rownames(tmp$hm_data)[tmp$row_clust$order]
+pData <- prepHeatmapData(d[darOrderTmp,], do_scale=TRUE)
+pData <- melt(as.data.table(pData, keep.rownames="rid"), variable.name="library_name", measure.vars=colnames(pData))
+pData[, module_id_tmp:=peaksDt[rid, module_id_tmp]]
+pData <- merge(pData, dA, by="library_name")
+
+tmp <- dtToDf(dcast(pData[condition=="WT", mean(value), by=.(day_fac, module_id_tmp)], module_id_tmp~day_fac, value.var="V1"))[,DAY_ORDER]
+
+modOrderTmp <- (rownames(tmp)[seriation::get_order(seriation::seriate(tmp))])
+round(tmp[modOrderTmp,])
+```
+
+```{r atac_modules_4}
+darOrder <- unlist(lapply(split.data.frame(d[darOrderTmp,], f=peaksDt[darOrderTmp, factor(module_id_tmp, levels=modOrderTmp)]), function(mat) {
+	rownames(mat)[seriation::get_order(seriation::seriate(mat))]
+}), use.names=F)
+modOrder <- paste0("R",1:K)
+moduleIds <- structure(modOrder, names=modOrderTmp)
+peaksDt[!is.na(module_id_tmp), module_id:=moduleIds[module_id_tmp]]
+peaksDt[is.na(module_id), module_id:=BG_NAME]
+peaksDt[, module_id_tmp:=NULL]
+moduleIds <- structure(peaksDt$module_id, names=peaksDt$rid)
+
+setkey(dA, library_name)	
+setkey(peaksDt, rid)
+
+# DAR modules:
+regionSetsOfInterest <- c(regionSetsOfInterest, sapply(split(peaksDt[sig==T,], by="module_id"), dtToGr, metaCols=c("rid")))
+```
+
+### 2. Region modules R7-R9 = differential in MUT, but not during differentiation 
+
+= "de-novo DARs"
+
+```{r atac_denovo_1}
+# pick "differential && module=="BG"
+tmp <- sapply(2:length(CONDITION_ORDER), function(condI) {
+	dtToGr(peaksDt[get(CONDITION_ORDER[condI])==TRUE & module_id=="BG",], metaCols="rid")
+}, simplify=FALSE)
+names(tmp) <- paste_(CONDITION_ORDER[-1],"denovo")
+regionSetsOfInterest[names(tmp)] <- tmp
+
+peaksDt <- merge(peaksDt, dcast(rblapply(tmp, function(x) data.table(rid=x$rid)), rid~id), by="rid", all.x=TRUE)
+forEach(names(tmp), function(x) {
+	peaksDt[, (x):=!is.na(get(x))]
+})
+```
+
+```{r atac_denovo_2}
+moduleRegs <- unique(unlist(sapply(tmp, function(x) x$rid)))
+KK <- 3
+
+tmp <- versionedCache("atac_modules_denovo", instruction={		
+
+	hmData <- prepHeatmapData(input_data[module_regs, module_samples], do_scale=T)
+
+	# * calculate distance matrix and perform clustering:
+	distMat <- dist(hmData, method=dist_meth)
+	rc <- fastcluster::hclust(distMat, clust_meth)
+	
+	return(list(hm_data=hmData, row_clust=rc))
+	
+}, buildEnvir=list(
+  input_data=d, module_regs=moduleRegs, module_samples=moduleSamples, dist_meth=ATAC_DIST_METH, clust_meth=ATAC_CLUST_METH
+))
+```
+Assign each DAR to one of those "modules":
+
+```{r atac_denovo_3}
+peaksDt[, module_id_tmp:=paste0("tmp",cutree(tmp$row_clust, k=KK)[rid])]
+setkey(peaksDt, rid)
+```
+
+Figure out an order of region modules that puts the modules in roughly temporal order:
+
+```{r atac_denovo_4}
+darOrderTmp <- rownames(tmp$hm_data)[tmp$row_clust$order]
+pData <- prepHeatmapData(d[darOrderTmp,], do_scale=T)
+pData <- melt(as.data.table(pData, keep.rownames="rid"), variable.name="library_name", measure.vars=colnames(pData))
+pData[, module_id_tmp:=peaksDt[rid, module_id_tmp]]
+pData <- merge(pData, dA, by="library_name")
+
+tmp <- dtToDf(dcast(pData[, mean(value), by=.(day_fac, module_id_tmp)], module_id_tmp~day_fac, value.var="V1"))[,DAY_ORDER]
+
+modOrderTmp <- (rownames(tmp)[seriation::get_order(seriation::seriate(tmp))])
+round(tmp[modOrderTmp,])
+
+denovoOrder <- unlist(lapply(split.data.frame(d[darOrderTmp,], f=peaksDt[darOrderTmp, factor(module_id_tmp, levels=modOrderTmp)]), function(mat) {
+	rownames(mat)[seriation::get_order(seriation::seriate(mat))]
+}), use.names=F)
+denovoModOrder <- paste0("R",(K+1):(K+KK))
+denovoIds <- structure(denovoModOrder, names=modOrderTmp)
+peaksDt[!is.na(module_id_tmp), denovo_id:=denovoIds[module_id_tmp]]
+peaksDt[is.na(denovo_id), denovo_id:=BG_NAME]
+peaksDt[, module_id_tmp:=NULL]
+denovoIds <- structure(peaksDt$denovo_id, names=peaksDt$rid)
+```
+Define to be used for all modules:
+
+```{r atac_denovo_5}
+setkey(dA, library_name)	
+setkey(peaksDt, rid)
+
+peaksDt[, all_mods_id := module_id]
+peaksDt[denovo_id!="BG", all_mods_id := denovo_id]
+allModsOrder <- names(COLOR_PALETTES$all_mods_id)
+
+# DAR modules:
+regionSetsOfInterest <- c(regionSetsOfInterest, sapply(split(peaksDt[sig==T & denovo_id!="BG",], by="denovo_id"), dtToGr, metaCols=c("rid")))
+```	
+
+Define groups of ROIs to be juxtaposed in plots:
+
+```{r cmps}
+cmpSelections <- list(
+	all_mods_id = names(COLOR_PALETTES$all_mods_id),
+	mut_effects = c(CONDITION_ORDER[-1],"BG"),
+	mut_effects_dir = c(paste_(CONDITION_ORDER[-1],"up"),paste_(CONDITION_ORDER[-1],"down"))
+)
+
+cmpSummary <- rblapply(cmpSelections, function(x) {
+  print(x)
+	rblapply(regionSetsOfInterest[x], function(y) data.table(n = length(y)), "id")	
+}, "cmp")
+fwrite(cmpSummary, file=resultsDir("cmp_summary.csv"))
+print(cmpSummary)
+```
+
+Save caches to be used in follow-up analyses:
+
+```{r save_caches}
+cmpSelections <- versionedCache(CACHE_ATAC_COMPARISONS, instruction={ cmp_selections }, buildEnvir=list(cmp_selections=cmpSelections))
+regionSetsOfInterest <- versionedCache(CACHE_ATAC_REGION_SETS, instruction={ rois }, buildEnvir=list(rois=regionSetsOfInterest))
+peaksDt <- versionedCache(CACHE_ATAC_PEAKS_ANNOTATED, instruction={ annot_peaks }, buildEnvir=list(annot_peaks=peaksDt))
+regionOrder <- versionedCache(CACHE_ATAC_REGION_ORDER, instruction={ c(dar_order,denovo_order) }, buildEnvir=list(dar_order=darOrder, denovo_order=denovoOrder))
+```
+
+### Heatmaps
+
+Visualize acessibility across all DARs in different stages and conditions:
+
+```{r dar_heatmap, fig.width=12, fig.height=8}
+selCols <- grep("_(up|down)", colnames(peaksDt), value=TRUE)
+
+i <- c(darOrder,denovoOrder)
+hm <- plotHMorder(d[i,], row_cols=c("all_mods_id", paste_(CONDITION_ORDER[-1],"up"),paste_(CONDITION_ORDER[-1],"down")), n=sprintf("Chromatin Modules & De-Novo, n = %d", length(i)), row_lbls=rep("",length(i)), do_scale=TRUE, rc=FALSE, gaps_row=peaksDt[i, .N, by=factor(all_mods_id, levels=allModsOrder)][,cumsum(N)])
+
+pdf(figuresDir("figure_atac_heatmap.pdf"), width=12, height=8)
+ComplexHeatmap::draw(hm)
+dev.off()
+
+ComplexHeatmap::draw(hm)
+
+fwrite(data.table(region_id=i, module_id=peaksDt[i,all_mods_id], round(d[i,],3), peaksDt[i,c(paste_(CONDITION_ORDER[-1],"up"),paste_(CONDITION_ORDER[-1],"down")),with=FALSE]), file = figuresDir("figure_atac_heatmap_data.csv"))
+```
+
+
+
+### Euler diagrams
+
+Visualize overlap between DARs:
+
+```{r dar_venn}
+print(colSums(peaksDt[,c("17q","17q1q","17q1qMYCN")]))
+print(plot(eulerr::euler(peaksDt[,c("17q","17q1q","17q1qMYCN")]))	)
+
+pdf(figuresDir("figure_atac_venn.pdf"), width=3, height=2)
+print(plot(eulerr::euler(peaksDt[,c("17q","17q1q","17q1qMYCN")]))	)
+dev.off()
+
+fwrite(peaksDt[,.(rid, `17q`=`17q`*1, `17q1q`=`17q1q`*1, `17q1qMYCN`=`17q1qMYCN`*1)], file = figuresDir("figure_atac_venn_data.csv"))
+```
+
+
+### Line plots
+
+Visualize mean accessbility in per cell line and stage in each module:
+
+```{r module_line_plots}
+i <- c(darOrder,denovoOrder)
+
+pAgg <- prepHeatmapData(d[i,], do_scale=FALSE)
+pAgg <- rblapply(split.data.frame(pAgg, f=peaksDt[i, factor(all_mods_id, levels=allModsOrder)]), function(x) { 
+	y <- colMeans(x, na.rm=T) 
+	data.table(library_name=names(y), value=y)
+}, "all_mods_id")
+pAgg <- merge(pAgg, dA, by="library_name")
+
+p <- ggplot(pAgg[all_mods_id!=BG_NAME, ], aes(x=day, y=value, color=condition)) + stat_summary(geom="point", size=0.5, fun.data="mean_se") + stat_summary(geom="line", fun.data="mean_se") + facet_wrap(all_mods_id~., nrow=3) + defTheme() + scale_color_manual(values=COLOR_PALETTES$condition, guide="none") + xlab(NULL) + ylab("Mean normalized read count") + themeBoxed(panel.grid.major.y=element_line(size=0.25)) + scale_x_continuous(breaks=as.numeric(gsub("D","", DAY_ORDER)))
+
+
+ggsave(filename = figuresDir("figure_atac_lines.pdf"), plot = p, width = 6, height = 3, dpi = 600, unit = "in")
+fwrite(pAgg[all_mods_id!=BG_NAME, .(module_id = all_mods_id, library_name, condition, day, value)], file = figuresDir("figure_atac_lines_data.csv"))
+
+print(p)
+```
+
+### Pie charts
+
+Summarize distribution of DARs over modules:
+
+```{r module_numbers}
+
+pData <- peaksDt[, .(N=.N, N_str=prettyIntegers(.N)), by=.(module=all_mods_id, chr17q=`17q`,chr17q1q=`17q1q`,chr17q1qMYCN=`17q1qMYCN`)]
+pData <- pData[order(module, !`chr17q`,!`chr17q1q`,!`chr17q1qMYCN`),]
+
+print(pData)
+
+cmp <- setdiff(cmpSelections$mut_effects_dir,BG_NAME)
+
+pData <- melt(peaksDt, measure.vars=cmp)
+pData[value==TRUE, val:=variable]
+pData[value==FALSE, val:=BG_NAME]
+
+pDataX <- pData[, .(perc_of_module=sum(value)/.N, n=sum(value), .N), by=.(all_mods_id, mut=variable)][, .(perc_of_module,all_mods_id, n, N, perc_of_mut=n/sum(n), pos=cumsum(n/sum(n))), by=mut]
+
+pDataX[, mut_simple:=gsub("_(up|down)","",mut)]
+
+nByMut <- pDataX[, .(N=sum(n)), by=.(mut)]
+nByMut <- structure(nByMut$N, names=as.character(nByMut$mut))
+
+pDataX[grepl("down",mut), n:= -n]
+
+pDataX <- pDataX[all_mods_id!="BG",]
+p1 <- ggplot(pDataX, aes(x=1, y=perc_of_mut, fill=all_mods_id)) + geom_bar(stat="identity") + theme_void() + scale_y_continuous(expand=c(0,0)) + scale_fill_manual(values=repl(COLOR_PALETTES$all_mods_id,BG_NAME,"grey",by_name=T), guide="none") + ylab(NULL) + xlab(NULL) +
+  coord_polar("y", start=0) + facet_wrap(~mut, nrow=2, labeller=function(x) data.frame(mut=sprintf("%s\nn = %s", x$mut, prettyIntegers(nByMut[as.character(x$mut)]))))
+p3 <- ggplot(pDataX, aes(x=all_mods_id, y=n)) + geom_bar(aes(fill=all_mods_id), stat="identity") + defTheme(noLegendTitle=F, topLegend=T, flipX=T) + geom_hline(yintercept=0)	+ themeBoxed(panel.grid.major.y=element_line()) + facet_wrap(~mut) + scale_fill_manual(values=repl(COLOR_PALETTES$all_mods_id,BG_NAME,"grey",by_name=T), guide="none") + ylab("Peaks affected (n)") + xlab(NULL)  + facet_wrap(~mut_simple, nrow=1)
+
+ggsave(filename = figuresDir("figure_atac_pies.pdf"), plot = p1, width = 6, height = 3, dpi = 600, unit = "in")
+ggsave(filename = figuresDir("figure_atac_bars.pdf"), plot = p3, width = 6, height = 2, dpi = 600, unit = "in")
+fwrite(pDataX, file = figuresDir("figure_atac_pies_and_bars_data.csv"))
+
+
+print(p1)
+print(p3)
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

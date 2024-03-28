@@ -1,0 +1,189 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Annotation with NB super-enhancers' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we overlap ATAC-seq regions with neuroblastoma-linked super-enhancers from previous publications.
+This information is not directly displayed in the paper figures, but it is used later for enrichment analysis.
+
+All `*_annotate_*.Rmd` notebooks compile metadata for the ATAC-seq peaks peaks which are then used in `08_enrichments.Rmd`.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(patchwork)
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS)
+```
+
+
+# Load SE annotations
+
+```{r load_se_regs}
+seAnnotTypes <- c()
+
+msg("Van Groningen et al. (2017)")
+n <- "vg2017"
+annot <- versionedCache(n, instruction={
+  dt <- fread(externalDataDir("vangroningen2017.csv"))
+  dt[, annot := "BG"]
+  dt[limma_pval <= 0.05 & grepl("MES", sample_ids) & !grepl("ADR", sample_ids), annot := "MES"] 
+  dt[limma_pval <= 0.05 & !grepl("MES", sample_ids) & grepl("ADR", sample_ids), annot := "ADR"]
+  #dt[, .N, by=annot]
+  
+  # lift over to hg38:
+  gr <- unlist(liftOver(dtToGr(dt, "chrom", "chromstart", "chromend", metaCols = "annot"), from="hg19"))
+  
+	# find overlaps with peaks:
+	o <- findOverlaps(dtToGr(peaks_dt), gr)
+	
+	# collapse multiple overlaps into one string:
+	tmp <- elementMetadata(gr)$annot
+	o <- as.data.table(o)[,.(vg2017_type=unique(tmp[subjectHits])),by=queryHits][order(vg2017_type),.(annot=paste0(vg2017_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	
+	return(o)
+}, recreate=F, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+seAnnotTypes <- c(seAnnotTypes, n)
+
+msg("Boeva et al. (2017)")
+n <- "bo2017"
+annot <- versionedCache(n, instruction={
+	dt <- fread(externalDataDir("boeva2017.csv"))
+	dt[, annot := "BG"]
+  dt[`Wilcoxon p-value (two sided test)` <= 0.05, annot := ifelse(`FC Score Group I over Group II` > 1, "MES", "ADR")]
+ 
+	 # lift over to hg38:
+  gr <- unlist(liftOver(dtToGr(dt, "Chromosome", "Start", "End", metaCols = "annot"), from="hg19"))
+  
+	# find overlaps with peaks:
+	o <- findOverlaps(dtToGr(peaks_dt), gr)
+	
+	# collapse multiple overlaps into one string:
+	tmp <- elementMetadata(gr)$annot
+	o <- as.data.table(o)[,.(bo2017_type=unique(tmp[subjectHits])),by=queryHits][order(bo2017_type),.(annot=paste0(bo2017_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+seAnnotTypes <- c(seAnnotTypes, n)
+
+msg("Gartlgruber et al. (2020)")
+n <- "ga2020top"
+annot <- versionedCache(n, instruction={
+	
+	dt <- fread(externalDataDir("gartlgruber2020.csv"))
+	dt[, annot := "BG"]
+	dt[`Signature ChIPseq Top10Percent`!="", annot := `Signature ChIPseq Top10Percent`]
+	dt[, .N, by=annot]
+# > sigSEs[,.N,by=`Signature ChIPseq Top10Percent`]
+   # Signature ChIPseq Top10Percent    N
+# 1:                                1373
+# 2:                            MES  176
+# 3:                         MNA-HR  147
+# 4:                         MNA-LR  136
+# 5:                           MYCN  141
+
+	gr <- unlist(liftOver(dtToGr(dt, "seqnames", "start", "end", metaCols=c("annot")), from="hg19"))
+	
+	# find overlaps with peaks:
+	o <- findOverlaps(dtToGr(peaks_dt), gr)
+	
+	# collapse multiple overlaps into one string:
+	tmp <- gr$annot
+	o <- as.data.table(o)[,.(ga2020top_type=unique(tmp[subjectHits])),by=queryHits][order(ga2020top_type),.(annot=paste0(ga2020top_type, collapse=";")), by=.(rid=peaksDt$rid[queryHits])]
+	
+	return(o)
+}, buildEnvir=list(peaks_dt=peaksDt[, .(chrom, start, end, rid)]))
+seAnnotTypes <- c(seAnnotTypes, n)
+```
+
+# Add SE annotations to peaks
+
+```{r summarize_se_regs}
+unannotLabel <- "Unannotated"
+seAnnots <- list()
+
+enrichmentDatabases <- list()
+
+for(n in seAnnotTypes) {
+	# load peak-region mappings:
+	o <- latestCache(n)
+	setnames(o, c("rid", paste_(n,"type")))
+
+	# add to peak annotation table:
+	suppressWarnings(peaksDt[, paste_(n,"se"):=NULL])
+	peaksDt <- merge(peaksDt, o, by="rid", all.x=T)
+	peaksDt[is.na(get(paste_(n,"type"))), paste_(n,"type"):=unannotLabel]
+		
+	# overview plots:
+	pData <- peaksDt[,.N,by=.(agg_by=get(paste_(n, "type")))]	
+	pData[!agg_by%in%pData[N>=100, agg_by], agg_by:="Other"]
+	pData <- pData[, .(N=sum(N)), by=agg_by]
+	p1 <- ggplot(pData, aes(x=N, y=reorder(agg_by, N))) + geom_bar(stat="identity", fill="black") + defTheme() + ylab(NULL) + scale_x_continuous(expand=c(0,0))	
+	ssplit <- sapply(peaksDt[,get(paste_(n, "type"))], strsplit, split=";")	
+	pData2 <- as.data.table(table(unlist(ssplit, use.names=FALSE)))[order(-N), .(agg_by=V1, N)]
+	pData2[!agg_by%in%pData2[N>1, agg_by], agg_by:="Other"]
+	pData2 <- pData2[, .(N=sum(N)), by=agg_by]
+	p2 <- ggplot(pData2, aes(x=N, y=reorder(agg_by, N))) + geom_bar(stat="identity", fill="black") + defTheme() + ylab(NULL) + scale_x_continuous(expand=c(0,0))
+	print(p1+p2)
+	seAnnots[[paste_(n,"type")]] <- pData2[order(-N), agg_by]
+			
+	# save annotations for use in follow-up analysis (i.e., enrichment analysis):
+	listNames <- setdiff(seAnnots[[paste_(n,"type")]], unannotLabel)
+	enrichmentDatabases[[paste_("se",n,"type")]] <- list(
+		lists = parallel::mclapply(listNames, function(curCat) {
+			peaksDt$rid[sapply(ssplit, function(x) curCat%in%x)]
+		}, mc.cores=12),
+		univ = peaksDt[get(paste_(n,"type"))!=unannotLabel,rid]	# all peaks with at least one annotated overlap
+	)
+	names(enrichmentDatabases[[paste_("se",n,"type")]]$lists) <- listNames
+	
+}
+```
+
+```{r save_se_annots}
+db <- versionedCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "nbse"), instruction={
+  return(enrich_dbs)
+}, buildEnvir=list(enrich_dbs=enrichmentDatabases))
+
+print(sapply(db, function(x) sapply(x$lists,length)))
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

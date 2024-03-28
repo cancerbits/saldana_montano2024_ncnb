@@ -1,0 +1,1327 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: 04 full dataset analysis, cell type identity analysis, mutation score."
+author: "Luis Montano"
+date: '2023-08-07'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+  outpath: '~/mnt_out/figures/'
+  resourcepath: "~/mnt_resources/"
+  celltalkpath: '~/path/to/cell_cell_interactions/CellTalkDB/human_lr_pair.rds'
+  gtfpath: '~/path/to/input_data/gencode.v40.annotation.gtf.gz'
+  fig_width: 6
+  fig_height: 4
+---
+
+# Analysis of full dataset.
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R It requires the seurat_WT_processed_clusters_markers.RData seurat object produced previously as well as the output of scrna/02_4
+
+## Outputs
+
+* The processed full dataset with clusters and markers
+* Some the contents of Fig 2  figure 3, and supplementary figure 2
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Load functions and relevant variables, and prepare workspace
+
+```{r}
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+options(future.globals.maxSize = 6 * 10^9)
+vfeatures=5000
+pcdims=30
+umapdims=10
+sz=.02
+threed=F #use if a 3d umap is desired
+tsca=200
+
+################################################################################
+# setting UMAP parameters
+################################################################################
+  fnn=30
+  ftag="WT"
+  fmd=0.4
+  pval=0.05
+  padj=pval
+  minfc=1
+  fdr=0.05
+  selecttop=20
+  ncells.show=200
+  method.markers="deseq"
+  method.seriate="seurat"
+  umapclusres=.6
+  finalclusvar="mutant.clusters"
+################################################################################
+#### comparison heatmap parameters
+################################################################################  
+  numcells=100
+
+################################################################################
+# recreation/ reloading controls
+################################################################################  
+  fullrecreate.list=list(
+  cors=F,
+  rgeneposint=T,
+  fulltable=T
+  )
+    
+fullreload.list=list(
+  cors=T,
+  rgeneposint=F,
+  fulltable=F)
+
+  fullrecreate=function(x){
+
+  if(!(x %in% names(fullrecreate.list))){
+    return(F)
+    }else{return(fullrecreate.list[[x]])}
+}
+
+    fullreload=function(x){
+
+  if(!(x %in% names(fullreload.list))){
+    return(T)
+    }else{return(fullreload.list[[x]])}
+}  
+  
+
+################################################################################
+#glasswork plot parameters
+################################################################################
+gwvarr="stage"
+
+  sca=10
+  rr=600
+  ssca=200
+  varrlab=gwvarr
+  sca=10
+  rr=600
+  ssca=180
+  hullpointsize=0.1
+  fillvar="clusterfrac"
+colorpoints="type"
+plotmeth="jitter"
+concavity=2
+
+################################################################################
+# mutation score general parameters
+################################################################################
+numtop=400
+maxlabel=40
+corvar="nnmutscore"
+cells.per.condition=1000
+cormethod="pearson"
+
+
+################################################################################
+#
+################################################################################
+
+
+includestages=c("D9", "D14", "D19")
+
+```
+
+Load full 10x dataset
+```{r}
+#load integrated single cell experiment wih data across all datasets
+
+simpleCache("seurat_alldatasets_scvi_hvg", assignToVar="sma", reload=fullreload("loadfull"), recreate=fullrecreate("loadfull"))
+
+
+```
+
+List of several UMAP parameters
+
+```{r}
+umap.pars=list(
+       one=list(assay="sctscvi", umapname="umap.fullscvi9", reduction.key=prepare.rk("umap.fullscvi9"), pcared="scvi", nn=fnn, md=fmd, umapdims=9),
+        two=list(assay="sctscvi", umapname="umap.fullscvi10", reduction.key=prepare.rk("umap.fullscvi10"), pcared="scvi", nn=fnn, md=fmd, umapdims=10),
+               three=list(assay="RNA", umapname="umap.fullscvi10", reduction.key=prepare.rk("umap.fullscvi10"), pcared="scvi", nn=fnn, md=fmd, umapdims=10),
+        four=list(assay="RNA", umapname="umap.fullscvi9", reduction.key=prepare.rk("umap.fullscvi9"), pcared="scvi", nn=fnn, md=fmd, umapdims=9), 
+       
+       ##main parameter set used
+               five=list(assay="RNA", umapname="umap.fullscvi8", reduction.key=prepare.rk("umap.fullscvi8"), pcared="scvi", nn=fnn, md=fmd, umapdims=8)
+)
+
+### choosing umap, attaching such parameter set to use. 
+umapchoice=5
+  ur=umap.pars[[umapchoice]]$umapname
+  ass=umap.pars[[umapchoice]]$assay
+  red=umap.pars[[umapchoice]]$pcared
+  rk=umap.pars[[umapchoice]]$reduction.key
+  nn=umap.pars[[umapchoice]]$nn
+  md=umap.pars[[umapchoice]]$md
+  umapdims=umap.pars[[umapchoice]]$umapdims
+```
+
+## Performing chosen UMAP
+
+```{r}
+  
+  sma <- RunUMAP(sma, reduction = red, dims = 1:umapdims, return.model=T, min.dist=md, n.neighbors=nn, repulsion.strength=1, verbose=T, assay=ass, reduction.name=ur,reduction.key=rk,umap.method="umap-learn", metric="correlation")
+
+
+```
+
+
+
+## Plot UMAP, single variable
+```{r}
+
+sca=10
+rr=600
+varr="stage"
+varrlab=varr
+
+tpng(paste_("UMAP", varr), wi=w*sca, he=w*sca, res=rr)
+wp=ggumap(sma, colorby=varr, labelby=varrlab, reduction=ur, reduction.key=rk, colorlist=allcolors, ssca=350)+NoAxes()+NoLegend()
+wp
+dev.off()
+wp
+```
+
+## PLot UMAP, multiple variables at once. Figure 4 a
+
+```{r,  fig.width=15, fig.height=8}
+sca=5
+sz=0.001 #scaling of points
+ssca=15000 # scaling of in-plot text relative to points
+allktypes= sma %>% metadata %>% pull(kamenevatype) %>% unique 
+allcolors[["kamenevatype"]]= randomcolors(length(allktypes)) %>% givename(., allktypes)
+allcolors[["kamenevatype"]]["endothelium"]="red"
+tit=paste0(red," " ,umapdims, " dimensions", "dims", umapdims, "md", md, "nn", nn)
+
+
+tpdf(path=params$outpath, paste_("UMAP_alldatasets_SCT_assay"), wi=pw*sca*1.5, he=pw*sca)
+
+pl4=lapply(c("stage", "ccondition", "replicate", "Phase", "kamenevatype", "type3", "mapfun_janskytype"), function(varr){
+  pka=ggumap(sma, colorby=varr, sz=sz,ssca=ssca, labelby="none", reduction=ur, reduction.key=rk, colorlist=allcolors, legend.size=15)+
+ ggtitle(paste("umap by",varr, tit))+NoAxes()
+}) %>% Reduce('+', .)
+print(pl4)
+dev.off()
+pl4
+
+
+```
+
+
+Store full dataset with UMAP
+```{r}
+simpleCache(paste0("fulldataset_withUMAP_parset_", umapchoice)#, {sma}
+            , assignToVar="sma", reload=T)
+```
+
+
+calculate kameneva paper signature scores on dataset
+
+```{r, fig.width=12, fig.height=12}
+
+nolivermarkers=dropfield(adamarkers, "liver")
+
+sma=AddModuleScore(sma, features=nolivermarkers, name=nolivermarkers %>% names)
+
+#Warning: The following features are not present in the object: EFFL7, not searching for symbol synonyms
+#Warning: The following features are not present in the object: CYP17A1, CYP21A2, not searching for symbol synonyms
+#Warning: The following features are not present in the object: HBA2, not searching for symbol synonyms
+#Warning: The following features are not present in the object: HNF4A, ITIH1, not searching for symbol synonyms
+
+
+```
+
+
+plotting marker strength of different cell types across clusters
+
+```{r, fig.width=8, fig.height=8}
+markercols=c("SCP1", "sympathoblasts2", "mesenchyme3", "intermediate_mesoderm4", 
+"melanocytes5", "endothelium6", "stemcells7", "cortex8", "erythroid9", 
+"kidney10", "chromaffin11") #"liver12")
+
+plm=lapply(markercols, function(m){
+  p=FeaturePlot(sma, features=m, reduction=ur, raster=T)+scale_color_viridis(option="D")+NoAxes()
+  p
+}) %>% Reduce('+', .)+plot_layout(ncol=4, nrow=4)
+
+sca=3
+tpdf(path=params$outpath, "UMAP_celltypemarkers_featureplots_fulldataset", wi=pw*sca, he=pw*sca)
+print(plm)
+dev.off()
+plm
+```
+
+
+## defining clustering parameters and performing clustering on umap; making glassworkplots
+
+```{r, fig.width=10, fig.height=10}
+library(concaveman)
+
+umapclusres=0.6
+knn= fnn # default during mapping expected to be 30
+
+umapred=ur
+nr=ur #neighbor reduction equals umap reduction. declared in previous blocks
+rungraphs=F
+runclusters=F
+umapsma=umapdf(sma, ur)
+tdims= list()
+tdims[[ur]]=2
+tdims[[red]]=10
+dimschoice=tdims[[ur]]
+umapnn.name.nns=paste0(nr, "_nn")
+umapsnn.name.nns=paste0(nr, "_snn")
+umapnn.name=paste0(nr, "_nngraph")
+umapsnn.name=paste0(nr, "_snngraph")
+graphchoice=umapnn.name
+nnchoice=umapsnn.name.nns
+clusvarname=paste0(graphchoice, "_res.", as.character(umapclusres))
+if(rungraphs==T | !exists("rungraphs") ){
+sma@graphs=list()
+sma@neighbors=list()
+gr=FindNeighbors(sma, reduction=nr, dims=1:dimschoice, graph.name=c(umapnn.name,umapsnn.name), k.param=knn)@graphs
+sma@graphs=gr
+#snn is not computed if return.neighbor is true
+neighbors=FindNeighbors(sma, 
+                             reduction=nr,
+                             dims=1:dimschoice,
+                             graph.name=umapnn.name.nns,
+                             return.neighbor=T, 
+                        compute.SNN=T,
+                             k.param=knn)@neighbors
+
+sma@neighbors=neighbors
+rungraphs=F
+}
+
+if(runclusters==T | !exists("runclusters")){
+
+sma=FindClusters(sma, res=umapclusres, graph.name=graphchoice)#, algorithm=4, method="igraph")
+runclusters=F
+}
+
+
+# extract umap information into a dataframe
+umapsma=umapdf(sma, ur)
+
+varr=clusvarname 
+library(viridis)
+    umapscwt= umapdf(sma, reduction=ur)
+    varrlab=varr
+    sca=10
+    rr=600
+    ssca=180
+    fillvar="clusterfrac"
+
+   colorpoints=varr
+
+
+   # generate concave polygons for each cluster
+   
+polys=clusterhull3(NULL, umap.df=umapsma, clusvar=clusvarname.mutant, clus=umapsma %>% pull(!!sym((clusvarname))) %>% unique, fillvar="null", linecolor="#000000", size=0.5, reduction.key=rk, fillcols="#FFFFFF00", concavity=2)
+
+tit=paste("graph:", graphchoice, ",resolution:", umapclusres, "\n")
+phulls=lapply(c("stage", "ccondition", "replicate", "Phase", "type2", finalclusvar), function(varr){
+  ggumap(sma, colorby=varr, labelby=clusvarname, reductions=umapred, reduction.key=rk)+ polys+ ggtitle(paste("umap by",varr, tit))+NoLegend()+ NoAxes()
+}) %>% Reduce('+', .)
+
+phulls
+
+
+
+
+```
+
+
+Merge and reorder clusters after curation based on signature sharing. Supplementary figure 5 b
+```{r, fig.width=10, fig.height=10}
+
+
+stage.ordered.clusters=sma %>% metadata %>% mutate(stagenumber=get.stage.number(stage)) %>% group_by(!!sym(clusvarname) ) %>% summarise(stagemean=mean(stagenumber)) %>% arrange(stagemean) %>% pull(!!sym(clusvarname)) %>% as.vector
+
+
+################################################################################
+#  rearranging clusters according to approximate developmental order, markers, cell type, etc.
+################################################################################
+
+###relabel, reorder and merge clusters *roughly* from day 0 to day 19
+sma@meta.data$seurat_clusters=sma@meta.data[[clusvarname]] %>% as.vector
+
+#### cluster algorithm=1 (Louvain) method matrix, umapclusres 0.6
+arrclusters.numbers=triagecells.multi2(sma, groupvar=clusvarname,c(27, 14, 11, 28, 29, 13, 39), c(35, 1, 37), c(0, 34),c(18, 10), c(20, 33), 
+c(32, 2, 26), 5, c(8, 24), c(12,15,38), c(25, 9, 3, 36), 
+ 21, c(22, 19),c(4, 30,31),17, c(6,7,16), 23) 
+
+
+
+arrclusters=arrclusters.numbers %>% addprefix(., "M")
+finalclusvarnumbers=paste0(finalclusvar, ".numbers")
+cluslabel=paste0(clusvarname, ".arranged")
+sma@meta.data[, cluslabel]=arrclusters 
+sma@meta.data[,finalclusvar]= arrclusters
+sma@meta.data[,finalclusvarnumbers]= arrclusters.numbers
+
+numclusters_arranged= arrclusters %>% unique
+allcolors[[cluslabel]]=namenums(randomcolors(numclusters_arranged %>% length), prefix="M", zero=F)
+allcolors[[finalclusvar]]=allcolors[[cluslabel]]
+allcolors[[finalclusvarnumbers]]=namenums(allcolors[[cluslabel]] %>% unname, zero=F)
+umapsma=sma %>% umapdf(., reductions=ur) %>% mutate(stageconditiontype= paste_(stage, ccondition, type, get(finalclusvar)))
+polys2=clusterhull2(NULL, umap.df=umapsma, clusvar=cluslabel, clus=umapsma %>% pull(!!sym((cluslabel))) %>% unique, fillvar="null", linecolor="#000000", size=0.5, reduction.key=rk, fillcols="#FFFFFF00", concavity=concavity)
+
+
+
+pa=ggumap(sma, colorby="type2", labelby=finalclusvar,  colorlist=allcolors, reductions=umapred, reduction.key=rk)+ polys2+ NoLegend()+NoAxes()
+
+pa
+
+finalclusvar.full="mutant.clusters"
+polys2=clusterhull3(NULL, umap.df=umapsma, clusvar=finalclusvar.full, clus=umapsma %>% pull(!!sym(finalclusvar.full)) %>% unique, fillvar="null", linecolor="#000000", size=0.5, reduction.key=rk, fillcols="#FFFFFF00", concavity=concavity)
+
+tit=paste("graph:", graphchoice, ",resolution:", umapclusres, "\n")
+phulls=lapply(c("stage", "ccondition", "replicate", "Phase", "type3"), function(varr){
+  ggumap(sma, colorby=varr, labelby=finalclusvar.full,  colorlist=allcolors, reductions=umapred, reduction.key=rk)+ polys2+  ggtitle(paste("umap by",varr, tit))+ NoLegend()+NoAxes()
+}) %>% Reduce('+', .)
+
+sca=3
+tpdf(path=params$outpath, paste0("UMAPfull_", finalclusvar.full, "_diverse_color_schemes"), wi=pw*sca*1.3, he=pw*sca)
+
+phulls
+
+dev.off()
+
+
+tit=paste("graph:", graphchoice, ",resolution:", umapclusres, "\n")
+phulls=lapply(c("stage", "ccondition", "replicate", "Phase", "type2"), function(varr){
+  ggumap(sma, colorby=varr, labelby="mutant.clusters",  colorlist=allcolors, reductions=umapred, reduction.key=rk, ssca=200)+ polys2+  ggtitle(paste("umap by",varr, tit))+ NoLegend()+NoAxes()
+}) %>% Reduce('+', .)
+
+phulls
+```
+
+store dataset with clusters
+```{r}
+simpleCache("fulldataset_with_clusters", {
+  
+  sma@meta.data[rownames(metadata(scwt)), "WT.clusters"]= metadata(scwt)[, "WT.clusters"]
+  sma}, assignToVar="sma", recreate=F, reload=T)
+```
+
+Markers for full dataset
+
+
+```{r}
+
+#generate markers
+full.dataset.markers.markers=get.markers(seuratmarkers.delegate(sma, group_column="mutant.clusters", replicate_column="orig.ident", minfc=minfc, selecttop=NULL, method=method.markers, getresidual=T, fullreload=F, fullrecreate=T, minrate=0.5))
+
+fm=full.dataset.markers.markers
+
+rrfm=lapply(allcolors[["mutant.clusters"]] %>% names, function(cl){
+  
+  fm %>% filter(group1==!!cl) %>% arrange(-log_fc)
+  
+}) %>% Reduce(rbind, .)
+
+fwrite(rrfm, file=file.path(params$outpath, "supp_table_8_markers_mutantclusters.csv"))
+
+
+fullsummary=sma %>% metadata %>% group_by(dsname, stage, ccondition, replicate) %>% summarise(counts=n())
+
+
+ord.datasets= c("G1", "G3", "G4", "G5", "G6", "G7", "G8", "G9", "G10", "G11", 
+"G12", "G13", "G14", "G15", "G16", "G17", "G18", "G19", "G20", 
+"G21", "G22", "G23", "G24", "G25", "G26", "G27")
+fullsummary.ordered=lapply(ord.datasets, function(x){
+  fullsummary %>% filter(dsname==!!x)
+  
+  }
+) %>% Reduce(rbind, .)
+
+
+fwrite(fullsummary.ordered, file=file.path(params$outpath, "supp_table_1_fulldataset_summary.csv") )
+
+```
+
+
+## Analysing markers from the mapping relative to the original clusters
+
+```{r fig_width=8, fig_height=8}
+##get markers for the specific condition
+simpleCache("topmarkers_fulldataset_mutant_clusters", {
+markers.mutant.clusters=seuratmarkers.delegate(sma, group_column="mutant.clusters", replicate_column="replicate", minfc=minfc, selecttop=selecttop, method=method.markers)$RNA@misc$top_markers
+markers.mutant.clusters
+}, assignToVar="markers.mutant.clusters", reload=fullreload("markers.mutant.clusters"))
+
+
+simpleCache("topmarkers_fulldataset_seurat_clusters", {
+markers.seurat.clusters=seuratmarkers.delegate(sma, group_column="seurat_clusters", replicate_column="replicate", minfc=minfc, selecttop=selecttop, method=method.markers)$RNA@misc$top_markers
+markers.seurat.clusters
+}, assignToVar="markers.seurat.clusters", reload=fullreload("markers.seurat.clusters"))
+
+
+replacemarkers=function(so, newmarkers){
+ if(!is.null(newmarkers)){
+  so$RNA@misc$top_markers=newmarkers 
+  return(so)
+  }else{
+ return(so)
+}}
+## get cell information for heatmap
+markerchoice= markers.seurat.clusters
+markers.var="seurat_clusters"
+
+cellinfo.markers=seriatecells(replacemarkers(sma, newmarkers=markerchoice), clusvar=markers.var, ass="sctscvi", meth=method.seriate, groupvarname="group1", lfcvarname="log_fc", extended.output=T, ncells=100)
+
+  nmarkers.show=10
+cellinfo.adjusted=seriategenes(sma, cellinfo.markers, assay="sctscvi") %>% adjust.markers(., nmarkers.show) %>% add.cell.annotation(sma,.,  vars=c("ccondition", "nnmutscore", "stage")) 
+
+mh=cellinfo.heatmap(sma, cellinfo.adjusted, assay="sctscvi", genes.to.label=(cellinfo.adjusted %>% adjust.markers(., 2))$markers, colorlist=allcolors)
+sca=5
+tpng(path=params$plotpath, paste_("heatmap_fulldataset", markers.var), wi=w*sca, he=w*sca)
+print(mh)
+dev.off()
+
+
+plts=lapply(adjust.markers(cellinfo.adjusted, 15)$markers, function(ff){
+FeaturePlot(sma, reduction=ur, features=ff)+NoAxes()+NoLegend()
+})
+
+plts[1:15] %>% Reduce('+', .)+plot_layout(ncol=5)
+
+plts[16:30] %>% Reduce('+', .)+plot_layout(ncol=5)
+
+
+```
+
+
+## Figure  2 g Grid of marker signature strength between wt and mutants
+
+```{r, fig.width=2*.8, fig.height=5*.8}
+# tages that are comparable across conditions.
+
+processid.gentab="2024-04-13"
+includestages=c("D9", "D14", "D19")
+varr="ccondition"
+xvar="gene"
+fvar="type"
+
+sca=4;
+rr=600
+wscale=12
+hscale=4
+adadict=lapply(adamarkers %>% names, function(nm) {
+  
+  givename(rep(nm,  length(adamarkers[[nm]])), adamarkers[[nm]])
+  
+}) %>% Reduce(c, .)
+xlevels=adadict %>% names
+
+celltypes=c("SCP", "sympathoblasts", "mesenchyme")
+geneselection=adamarkers[celltypes] %>% Reduce(c,. ) %>% removegene(., "EFFL7") 
+
+   gettype= Vectorize(function(x)  adadict[x])
+
+      
+
+
+sh=22
+th=0
+
+# calculating with a downsample of 100 cells (because of imbalanced stage-condition groups), averaging 200 samples
+simpleCache(paste0("markergrid_version", processid.gentab),{
+genetab8=lapply(1:200, function(x) {
+  gc()
+  set.seed(x)
+  dscells=sma %>% metadata %>% filter(stage %in% includestages) %>% names2col(., "cellids") %>% group_by(stage, ccondition) %>% sample_n(., 790) %>% ungroup() %>% as.data.frame %>% col2names(., "cellids") %>% rownames
+  f=join_meta_exp(sma , assay="sctscvi",genes=geneselection, cells= dscells, metacols=NULL) %>% 
+    pivot_longer(cols=geneselection, names_to="gene", values_to="expression") %>%
+    filter(stage!="D0") %>%  mutate(isexp= expression >th) %>% 
+    group_by( ccondition, gene) %>% summarise(mean_exp=mean(expression), std_exp=sd(expression), median_exp=median(expression), sumexp=sum(isexp),  counts=n(), pct_exp=sumexp/counts) %>%
+    ###in comparison to the previous rounds, we express the change in expression from the wild type as a subtraction. the percentage we leave as a ratio.
+    group_by(gene) %>% mutate(signature= gettype(gene), rmean=mean_exp-mean_exp[ccondition=="cWT"], rpct=pct_exp/pct_exp[ccondition=="cWT"]) %>% 
+    ungroup() %>% filter(signature %in% c("SCP","sympathoblasts","mesenchyme")) %>%
+    mutate(sample=x) %>%
+    as.data.frame
+})  %>% Reduce(rbind, .) %>% group_by(ccondition, gene) %>% summarise(rmean=mean(rmean), rpct=mean(rpct))
+set.seed(42)
+genetab8
+}, assignToVar="genetab8", reload=T )
+
+xvar="type"
+
+
+
+ctypes= c("SCP","sympathoblasts","mesenchyme")
+xlevels=ctypes
+yvar="ccondition"
+cvarr="signature"
+ylevels=allcolors[[yvar]] %>% names
+fvar="gene"
+flevels=c("MPZ", "PLP1", "STMN2", "ELAVL4", "COL1A1", "VIM")
+flevels2= c("SOX10", "PLP1", "FOXD3", "FABP7", "S100B", "ERBB3", "NGFR",
+            "MPZ", "COL2A1", "POSTN", "MOXD1", "GAS7", "ASCL1", "STMN2",
+            "ELAVL4", "STMN4", "ISL1", "PRPH", "ELAVL2", "HMX1", "PHOX2B",
+            "GATA3", "COL1A1", "COL1A2", "COL12A1", "COL3A1", "VIM", "CXCL12",
+            "TWIST1", "TWIST2")
+sca=.25;
+rr=600
+wscale=2
+hscale=5
+tpdf(path= params$outpath, paste_("pointplot_adamarkers_grid8average", "x-", xvar, "colorby", cvarr),width=pw*sca*wscale, height=pw*sca*hscale)#, res=rr )
+
+
+  gridd=ggplot(genetab8 %>% filter( !!sym(fvar) %in% flevels2),  aes(x=factor(!!sym(yvar), levels=ylevels), y=factor(!!sym(fvar), levels= flevels2)))+geom_point( shape=sh, aes( size=rpct, fill=rmean ))+
+
+    scale_fill_gradient2(low = "blue",mid = "white",high = "red")+
+
+    theme_classic()+
+    rotatex(90)
+print(gridd)
+dev.off()
+
+
+gridd
+```
+
+Figure 2 e. bar plots of proportions of cells at each stage
+
+```{r}
+## downsampling dataset 
+
+  set.seed(1)
+  dsset=sma %>% metadata %>% filter(stage %in% includestages) %>% names2col(., "cellids") %>% group_by(stage, ccondition) %>% sample_n(., 790) %>% ungroup() %>% as.data.frame %>% col2names(., "cellids") 
+
+
+bp=ggplot(dsset)+geom_bar(aes(x=factor(ccondition, levels=allcolors[["ccondition"]] %>% names %>% rev), fill=factor(type3, levels=allcolors[["type3"]] %>% names )), position="fill")+scale_fill_manual(values=allcolors[["type3"]], guide = guide_legend(title="Cell type" ))+theme_classic()+coord_flip()+ggtitle("")+xlab("")
+
+sca=0.5
+tpdf(path=params$outpath, "barplot_celltype_proportions_per_ccondition", wi=pw*sca*1.6, he=pw*sca)
+bp
+dev.off()
+
+
+set.seed(42)
+
+```
+
+
+Figure 2f Violin plots of the signature scores given a condition and kameneva mapping
+```{r}
+
+includestages=c("D9", "D14", "D19")
+
+sma.filtered=AddModuleScore(sma[,sapply(sma[["stage"]], function(x) x %in% includestages) ] , features=adamarkers, name=names(adamarkers))
+
+markercols=c("SCP1", "sympathoblasts2", "mesenchyme3", "intermediate_mesoderm4", 
+"melanocytes5", "endothelium6", "stemcells7", "cortex8", "erythroid9", 
+"kidney10", "chromaffin11", "liver12")
+
+plotnames=sapply(names(allcolors$ccondition), function(x) strsplit(x, split="c")[[1]][2])
+
+rnds=list(c("SCP", "SCP1"), c("mesenchyme", "mesenchyme3"), c("sympathoblasts", "sympathoblasts2"),c("chromaffin", "chromaffin11") )
+lapply(1:4, function(xx){
+  mfsigs= sma.filtered %>% metadata
+  hprop=4/3
+  ct=rnds[[xx]][1]
+  viovarr=rnds[[xx]][2]
+  fcat("making ggplot ", ct)
+  gvs= ggplot(mfsigs %>% filter(type3==ct), aes(x= factor(ccondition, levels=names(allcolors$ccondition)), y=!!sym(viovarr)))+
+    geom_violin( aes(fill= factor(ccondition, levels=names(allcolors$ccondition))))+
+    geom_jitter(size=.5, alpha=0.6)+
+    scale_fill_manual(values=rep((allcolors[["type3"]] %>% unlist)[ct], 4) %>% unname, labels=plotnames)+
+    theme_classic()
+  fcat("printing plot...")
+  sca=.5
+  rr=600
+  tpdf(path=params$outpath, paste_("violinplot",viovarr), he=pw*sca*hprop, wi=pw*sca*3)#, res=rr)
+  print(gvs+rotatex(90))
+  dev.off()
+})
+
+```
+
+
+# wt signatures on the full dataset
+
+```{r fig.height=8, fig.width=8}
+
+
+simpleCache("~/mnt_out/ncnb2/rcache//wtheatmap_clusterinfo_genes_lfct_1_numtop_250minrate0.5_2023-10-19seriationmethodseuratncells300", assignToVar="wtcellinfo", reload=T)
+
+sma=AddModuleScore(sma, wtcellinfo$markerlist)
+cnames=paste0("Cluster", 1:length(wtcellinfo$markerlist))
+wtsigplots=lapply(cnames, function(ff){
+FeaturePlot(sma, reduction=ur, features=ff)+NoAxes()+NoLegend()
+})
+
+wtsigplots %>% Reduce("+", .)+plot_layout(ncol=5, nrow=4)
+
+```
+
+
+# Figure 3 d-e Mutation score analysis. Preparation for figure 4 b-c
+
+```{r}
+library(magrittr)
+
+scells=sma %>% metadata %>% filter(stage %in% includestages) %>% rownames
+sm2a=sma[, scells]
+
+
+### calculating pca neighbors
+
+sm2a= RunPCA(sm2a, assay="sctscvi")
+
+if(is.null(sm2a@neighbors[["nnpca"]])){
+nbrs=FindNeighbors(sm2a, reduction="pca", dims=1:50, graph.name=c("nnpca"),return.neighbor=T, k.param=knn)@neighbors
+sm2a@neighbors$nnpca= nbrs[["nnpca"]]
+}
+if(is.null(sm2a@neighbors[["nnscvi"]])){
+nbrs=FindNeighbors(sm2a, reduction="scvi", dims=1:10, graph.name=c("nnscvi"),return.neighbor=T, k.param=knn)@neighbors
+sm2a@neighbors$nnscvi= nbrs[["nnscvi"]]
+}
+
+
+neighborchoice="nnscvi"
+
+    
+nn_idx <- sm2a@neighbors[[neighborchoice]]@nn.idx
+#KNN conditions table
+nn_conditions <- matrix(sm2a$ccondition[nn_idx],nrow(nn_idx), ncol(nn_idx))
+ 
+  nn_cmclusters <- matrix(sm2a[[finalclusvar]][nn_idx],nrow(nn_idx), ncol(nn_idx))
+
+  nn_stage <- matrix(sm2a$stage[nn_idx],nrow(nn_idx), ncol(nn_idx))
+
+ 
+ #find cells whose neighbors don't include cells from clusters of the other roi
+
+sm2a[["mixedstage"]] <- apply(nn_stage,1,function(x){length(unique(x))>1})
+
+
+    
+simpleCache("sm2a_with_mutationscore", {  
+
+
+#compute neighbourhood-based condition gradients
+sm2a$ccondition_entropy <- apply(nn_conditions,1,entropy)
+sm2a$wildtypness <- apply(nn_conditions,1,function(x){mean(x=="cWT")})
+#sm2a$wildtypness_density <- apply(nn_conditions,1,function(x){mean(x=="WT")})
+sm2a$condition_recode_average <- apply(nn_conditions,1,function(x){
+    x <- factor(x, levels = rev(allcolors$ccondition %>% names)) %>% as.integer()
+    mean(x)
+    })
+sm2a$nnmutscore=lapply(sm2a$condition_recode_average, function(x) 1-((x-1)/3)) %>% Reduce(c, .)
+
+
+sm2a}, assignToVar="sm2a", reload=T)
+
+simpleCache("sma_fulldataset_with_mutscore_D9_D14_D19",{
+sma@meta.data=sma@meta.data %>% mutate(nnmutscore=NA)
+sma@meta.data[sm2a@meta.data %>% rownames, "nnmutscore"]=sm2a@meta.data[, "nnmutscore"]
+sma
+}, assignToVar="sma", reload=T, recreate=F)
+
+
+
+
+sca=1
+lx=0
+ly=0.22
+tpdf(path=params$outpath, "neighborhood_mutation_score", he=pw*sca, wi=pw*sca);
+FeaturePlot(sm2a, features="nnmutscore", reduction=ur, raster=T)&theme(legend.position = c(lx, ly))+NoAxes(); dev.off()
+
+
+
+tpng(path=params$plotpath, "ccondition_entropy"); DimPlot(sm2a, group = "ccondition")+FeaturePlot(sm2a, features="ccondition_entropy", reduction=ur)&theme(legend.position = c(lx, ly)); dev.off()
+tpng(path=params$plotpath, "wildtypeness");FeaturePlot(sm2a, features="wildtypness", reduction=ur)+theme(legend.position = c(lx, ly)); dev.off()
+tpng(path=params$plotpath, "condition_recode_average", he=sca*w, wi=sca*w, res=rr);FeaturePlot(sm2a, features="condition_recode_average", reduction=ur)+theme(legend.position = c(lx, ly))+NoAxes(); dev.off()
+
+```
+
+Preparing correlation calculations  with the mutation score using a parameter list of what clusters and correlations to include in the calculation as well as other id parameters. 
+
+```{r}
+#######################################################
+#parameter setup 
+#######################################################
+nk=4 # just initialising the value
+ wnpars=list(one=list(          varname="roi",
+                                cluss=c("R1", "R2"),
+                                tag="M23toroi1_entropy",
+                                orderedclusters=c(1,3,5,6,13,18,8,4,16,2,10, 15,7,14,22,24,12,23,20,19,9,11, 17,21,25) %>% addprefix(., "M"),
+                                rois=           c(0,0,0,0,0 ,0 ,1,1,1 ,1,1 , 1 ,1,1 ,1 ,1 ,2 ,1 ,1 ,2 ,2, 2,  2, 2, 3) %>% addprefix(., "R"),
+                                calcent=T,
+                                removemycn=F, hex=2,wex=5.5,appendpairs=T, alph=0.01
+   ),
+              two=list(         varname="roi",
+                                cluss=c("R1", "R2"),
+                                tag="M23toroi2_entropy",
+                                orderedclusters=c(1,3,5,6,13,18,8,4,16,2,10, 15,7,14,22,24,12,23,20,19,9,11, 17,21,25) %>% addprefix(., "M"),
+                                rois=           c(0,0,0,0,0 ,0 ,1,1,1 ,1,1 , 1 ,1,1 ,1 ,1 ,2 ,2 ,1 ,2 ,2, 2,  2, 2, 3) %>% addprefix(., "R"),
+                                calcent=T,
+                                removemycn=F, hex=2, wex=5.5,appendpairs=T, alph=0.01
+                ), 
+   
+   
+              three=list(assay="sctscvi" ,    
+                varname="stage",
+                                cluss=includestages,
+                                tag="method3_highcor0p3",
+                                orderedclusters=allcolors[[finalclusvar]] %>% names,
+                                rois=   allcolors[["roi"]] %>% names        ,
+                                calcent=T,
+                                removemycn=T,hex=4.3,wex=3.5,appendpairs=F,
+                      alph=0.05,nk=4, meth=3,nullreadsfilter=1, #0.85
+                                                        sumfilter=2500,
+                        mincor=0.3, imposeorder=list(D6=NULL, D9=NULL,D10=NULL, D12=NULL, D14=NULL, D19=NULL, D28=NULL), renameclus=list(D6=NULL, D9=1:nk,D10=1:nk, D12=1:nk, D14=1:nk, D19=1:nk, D28=1:nk)),
+   
+   
+                              four=list(assay="sctscvi" ,    
+                                varname="roi",
+                                cluss=allcolors[["roi"]] %>% names,
+                                tag="method3_highcor0p3roi2",
+                                orderedclusters=allcolors[[finalclusvar]] %>% names,
+                                rois= allcolors[["roi"]] %>% names,
+                                calcent=T,
+                                removemycn=T,hex=4.3,wex=3.5,appendpairs=F,
+                                alph=0.05,nk=4, meth=3,nullreadsfilter=1, #0.85
+                                                        sumfilter=2500,
+                        mincor=0.3, imposeorder=rep(NULL, length(allcolors[["roi"]])), 
+                                renameclus=lapply(1:length(allcolors[["roi"]]), function(x) 1:nk) %>% givename(., allcolors[["roi"]] %>% names)
+                                ),
+      five=list(assay="sctscvi" ,    
+                                varname="roi",
+                                cluss=allcolors[["roistage"]] %>% names,
+                                tag="method3_highcor0p3roistage",
+                                orderedclusters=allcolors[[finalclusvar]] %>% names,
+                                rois= allcolors[["roi"]] %>% names,
+                                calcent=T,
+                                removemycn=T,hex=4.3,wex=3.5,appendpairs=F,
+                                alph=0.05,nk=4, meth=3,nullreadsfilter=1, #0.85
+                                                        sumfilter=2500,
+                        mincor=0.3, imposeorder=rep(NULL, length(allcolors[["roi"]])), 
+                                renameclus=lapply(1:length(allcolors[["roi"]]), function(x) 1:nk) %>% givename(., allcolors[["roi"]] %>% names)
+                                )
+   
+   )
+
+###############################################################################
+ #Selecting one parameter set for mutation score calculation and attaching variables.
+###############################################################################
+wparsel=3
+fcat("parameter set selected: ", wparsel, "...")
+varname=wnpars[[wparsel]]$varname
+cluss=  wnpars[[wparsel]]$cluss
+tag= wnpars[[wparsel]]$tag
+rois= wnpars[[wparsel]]$rois
+calcent=wnpars[[wparsel]]$calcent
+orderedclusters= wnpars[[wparsel]]$orderedclusters
+removemycn=wnpars[[wparsel]]$removemycn
+hex=wnpars[[wparsel]]$hex
+wex=wnpars[[wparsel]]$wex
+alph=wnpars[[wparsel]]$alph
+mincor=wnpars[[wparsel]]$mincor
+appendpairs=wnpars[[wparsel]]$appendpairs
+imposeorder=wnpars[[wparsel]]$imposeorder
+nk=wnpars[[wparsel]]$nk
+renameclus=wnpars[[wparsel]]$renameclus
+meth=wnpars[[wparsel]]$meth
+sumfilter=wnpars[[wparsel]]$sumfilter
+nullreadsfilter=wnpars[[wparsel]]$sumfilter
+ass.cor= wnpars[[wparsel]]$assay
+ #### neighbors of each cell classified according to clusters.
+```
+
+
+applying correlation calculations
+```{r}
+#frozen at 20240124
+datte.mutscore="20240124-1" #chopstring(timestamp(""))
+#####
+# main code to calculate top correlated genes
+#####
+     fullrecreate=F
+fullreload=
+   br=seq(-4,4,.1)
+cmap=c("#0B9988", "#f7f7f7", "#F9AD03") #petrol gold
+
+colls=colorRampPalette(cmap, space="rgb")(length(br))   #2.2
+
+   corbr=seq(-3,3,.1)
+corcmap=c("blue", "white", "red")
+
+corcolls=colorRampPalette(corcmap, space="rgb")
+library(circlize)
+col_fun = colorRamp2(c(-1,0,1), c("blue", "white", "red"))
+
+sca=.35
+
+
+allcors=lapply(cluss, function(clu){
+fcat("variable ", varname, ": cluster ", clu, "...") 
+
+  #recode order is the raw unnormalised form of the mutation score, which subsequently is adapted into a more intuitive interval.
+
+recode_order2=sm2a %>% metadata %>% filter( !!sym(varname)==clu) %>% arrange(!!sym(corvar)) %>% select(!!sym(finalclusvar), stage, ccondition,ccondition_entropy, nnmutscore, condition_recode_average)
+
+totcells=length(recode_order2 %>% rownames)
+matcounts=apply(sm2a@assays[[ass.cor]]@counts[, recode_order2 %>% rownames]==0, 1, sum)/totcells
+mat=sm2a@assays[[ass.cor]]@data[,recode_order2 %>% rownames] %>% as.matrix
+
+cc=1
+fcat("calculating correlations...")
+
+# gene expression correlations are directly with the mutation score, in the presence of mycn or absence of mycn, and correlations with the entropy (genes that favour a mixture of conditions)
+
+if(meth==3){
+
+recode_order3=recode_order2 %>% filter(ccondition!="c17q1qMYCN")
+arr=recode_order2 %>% pull(!!sym(corvar))
+arrmycn=recode_order3 %>% pull(!!sym(corvar))
+
+cellnames=recode_order2 %>% rownames
+cc=1
+simpleCache(paste_("mutscore_cluscors", tag, "parsel", wparsel,"searchmethod", meth, varname, clu, "cormethod", cormethod), {
+cluscors=lapply(VariableFeatures(sm2a, assay=ass.cor), function(gene){
+
+
+   fin=cor.test(arr, mat[gene, recode_order2 %>% rownames], method=cormethod, exact=TRUE)
+   entfin=cor.test(recode_order2 %>% pull(ccondition_entropy), mat[gene, recode_order2 %>% rownames], method=cormethod, exact=TRUE)
+   mycnfin=cor.test(arrmycn, mat[gene, recode_order3 %>% rownames], method=cormethod, exact=TRUE)
+    
+    cors=c(gene=gene, corr=fin$estimate %>% unname %>% as.numeric, pval=fin$p.value*3,  
+     mycnless.corr=mycnfin$estimate %>% unname %>% as.numeric, mycnless.pval=mycnfin$p.value*3,
+     entropy.corr=entfin$estimate %>% unname %>% as.numeric, entropy.pval=entfin$p.value*3, sumexp=sum(mat[gene, recode_order2 %>% rownames]), fzeros=matcounts[gene] %>% unname)
+    cc<<-cc+1
+    cors
+    }) %>% Reduce(rbind, .)%>% as.data.frame %>% col2names(., col="gene")
+cluscors}, assignToVar="cluscors",  reload=T)
+ fcat("finished correlations. organising filtered table")
+cc=0
+sumpvals=Vectorize(function(corr1, p1, corr2, p2, corr3, p3)  (((abs(as.numeric(corr1))>=mincor && as.numeric(p1)<=alph) || (abs(as.numeric(corr2))>=mincor && as.numeric(p2)<=alph) ||(abs(as.numeric(corr3))>=mincor && as.numeric(p3)<=alph))  %>% sum)
+)
+
+filteredcluscors= cluscors %>% mutate(signif=sumpvals(corr, pval, mycnless.corr, mycnless.pval, entropy.corr, entropy.pval)>0) %>% filter(signif==T) 
+
+#get top n for each correlation
+genes1=filteredcluscors %>% arrange(-abs(as.numeric(corr))) %>% head(numtop) %>% rownames
+genes2=filteredcluscors %>% arrange(-abs(as.numeric(mycnless.corr))) %>% head(numtop) %>% rownames
+genes3=filteredcluscors %>% arrange(-abs(as.numeric(entropy.corr))) %>% head(numtop) %>% rownames
+genesel= c(genes1, genes2, genes3) %>% unique 
+fcat("writing filtered table to file")
+fwrite(filteredcluscors, file=paste0(params$plotpath,timestamp(paste0("clus_cors_table_",clu, ".txt"))) )
+
+  genesel= filteredcluscors[genesel, ] %>% filter(as.numeric(fzeros)<= nullreadsfilter) %>% filter(as.numeric(sumexp)>= sumfilter) %>% arrange(-abs(as.numeric(corr))) %>% head(numtop) %>% rownames
+}
+
+
+
+################################################################################
+# Downsampling cells after calculation
+################################################################################
+
+
+fcat("Downsampling cells to", cells.per.condition, "cells per condition")
+simpleCache(paste_("downsampled_cells_for_nnmutscore_heatmap_parsel", wparsel, "method",meth, varname, clu, cells.per.condition,"cells_per_condition", datte.mutscore), { 
+recode_orderds= recode_order2 %>% names2col(., "cell_id") %>% sample_n(cells.per.condition, replace = FALSE) %>% ungroup %>% as.data.frame %>% col2names(., "cell_id") %>% select(!cell_id)
+dscells=recode_order2[recode_orderds %>% rownames, ] %>% arrange(nnmutscore) %>% rownames
+dscells
+}, assignToVar="dscells", reload=T)
+#getting the genes in each cluster and ordering them with seriation
+
+########################
+#block to reorder the clusters from earliest peak to latest peaking one
+########################
+
+
+fcat("creating sm2aller matrix with downsampled cells and selected genes")
+  mat2=mat[genesel, dscells]
+sds=apply( mat2, 1, sd)
+  mat3=mat2[(sds!=0) %>% names ,]
+  genesel0= rownames(mat3)
+  
+  
+  ##############################################################################
+  # filtering for genes that are present in the gtf
+  ##############################################################################
+  
+  if(!exists("gtftable")){ 
+gtfpath=params$gtfpath
+
+gtftable=rtracklayer::import(gtfpath)
+}
+
+##getting positions for all the relevant genes
+genepositions=gtftable %>% as.data.frame %>% select(seqnames, start, gene_name, type)%>% filter(type=="gene", gene_name %in% genesel0)
+
+##getting genes for which genomic tracks were found
+genesel=intersect(genesel, genepositions %>% col2names(., "gene_name") %>% rownames)
+  
+mat3=mat3[genesel, ]
+
+    pwtness<-ComplexHeatmap::pheatmap(mat3, 
+              scale="row", 
+              cluster_rows=TRUE, 
+              cluster_cols=FALSE,
+              show_colnames=F) #,gaps_col=60, silent=T)
+  
+  
+  cgenes=ComplexHeatmap::row_dend(pwtness) %>% as.hclust %>% cutree(nk) %>% sort 
+  cgenenames=cgenes %>% names
+  sgenes=cgenes
+
+  clusmeans=c()
+  ct=1
+  fcat("Seriating genes")
+s2genes=lapply(1: nk, function(nn){
+  
+  st= sgenes[sgenes==nn] %>% names
+  if(length(st)>1){
+  ss=seriation::get_order(
+    seriation::seriate(scale((mat3[st, dscells]) %>% t) %>%t)
+                       , method="BEA_TSP")
+  clusmeans[ct]<<- mean(colMeans(scale((mat3[st, dscells]) %>% t) %>%t)*(sapply(1:length(dscells), function(x) x**2, USE.NAMES=F)))
+  ct<<-ct+1
+  st[ss %>% unname]}else{
+    
+    clusmeans[ct]<<-mean(scale((mat3[st, dscells]) %>% as.numeric)*(sapply(1:length(dscells), function(x) x**2, USE.NAMES=F)))
+  }})
+ct=1
+names(clusmeans)= 1:nk
+
+s3classes=lapply(1:length(s2genes), function(x) rep(x, length(s2genes[[x]]))) %>% Reduce(c, .)
+s3genes=s2genes %>% Reduce(c, .)
+names(s3classes)= s3genes
+
+
+
+fcat("changing order of clusters if needed")
+
+if(is.null(imposeorder[[clu]])){
+  
+  fcat("no imposed order: sorting cells according to heaviness metric")
+  neworder=clusmeans %>% sort %>% names
+}else{
+  neworder=imposeorder[[clu]]
+
+}
+
+  
+rgenes=lapply(neworder, function(tt) s3classes[s3classes==tt]) %>% Reduce(c, .)
+    
+ rowgaps= rgenes %>% diff %>% as.logical %>% which    
+ pwtness2<-ComplexHeatmap::pheatmap(mat3[rgenes %>% names,], 
+              scale="row", 
+              cluster_rows=FALSE, 
+              cluster_cols=FALSE,
+              show_colnames=F,
+              gaps_row=rowgaps);
+  
+stri=paste_("rgenes_parset",wparsel,  varname, tag, "cluster", clu, "numtop", numtop, "alpha", alph, "mincor", mincor, "", datte.mutscore)
+simpleCache(stri, {list(rgenes=rgenes, clusmeans=clusmeans)},assignToVar="rgenelist", reload=T )
+
+
+
+##########################################################################
+#20220720 
+#  Functions to classifying genes whether they are transcription factors, receptors or ligands
+##########################################################################
+simpleCache(paste_("genes", "db", "human_tfs"), {
+  m <- fread("http://humantfs.ccbr.utoronto.ca/download/v_1.01/DatabaseExtract_v_1.01.csv")
+  m <- m[`Is TF?`=="Yes", `HGNC symbol`] #paste0(`Ensembl ID`,"-",`HGNC symbol`)]
+  m
+}, assignToVar="tfList", reload=T, recreate=F)
+istf= function(x) x %in% tfList 
+
+
+lrtable=readRDS(params$celltalkpath)
+isligand=function(x) x %in%  (lrtable %>% pull(ligand_gene_symbol))
+isreceptor=function(x) x %in%  (lrtable %>% pull(receptor_gene_symbol))
+islrpair=function(x) x %in%  (lrtable %>% pull(lr_pair))
+
+ geneguide=  1:length(rgenes)
+names(geneguide)=rgenes %>% names
+rgenes2=rgenes
+
+mrkrs=names(rgenes)[lapply(rgenes %>% names, istf) %>% Reduce(c,.)]
+ligands=names(rgenes)[lapply(rgenes %>% names, isligand) %>% Reduce(c,.)] 
+receptors=names(rgenes)[lapply(rgenes %>% names, isreceptor) %>% Reduce(c,.)] %>%  c(., "CRABP1","RARRES1") 
+allpairs=expand.grid(ligands,receptors) %>% apply(., 1, function(x) paste_(x[1], x[2]))
+ lrpairs=allpairs[lapply(allpairs, islrpair) %>% Reduce(c, .)]
+if(appendpairs){
+
+ mrkrs=append(mrkrs, lapply(lrpairs, function(x) strsplit(x, split="_")[[1]]) %>% Reduce(c, .) %>% unique) %>% unique
+}else{
+ mrkrs= c(mrkrs, ligands, receptors) 
+
+ mrkrs= filteredcluscors[mrkrs, ] %>% mutate(sumcor= abs(as.numeric(corr))+abs(as.numeric(entropy.corr))) %>% arrange(-sumcor) %>% head(maxlabel) %>% rownames
+ }
+ colorgene=function(x) {
+  
+  if(istf(x)){return("black")}else{
+  if(x %in% ligands){return("blue")}else{
+  if(x %in% receptors){return("red")}else{return("orange")}
+  }
+  }}
+ 
+ genecols= sapply(mrkrs, colorgene, USE.NAMES=F)
+  lines_gp= grid::gpar(col=genecols, labels_gp= grid::gpar(col=genecols))
+
+ha = ComplexHeatmap::rowAnnotation(foo = ComplexHeatmap::anno_mark(at = geneguide[mrkrs], labels = mrkrs, lines_gp= grid::gpar(col=genecols), labels_gp= grid::gpar(col=genecols)  ))
+
+  
+################################################################################
+##### integrating the information between gene positions, chromosome positions
+################################################################################
+rgenepos.int= (genepositions %>% col2names(., "gene_name"))[rgenes %>% names, ] %>% mutate(tclus= (rgenes %>% unname))
+
+
+rgenepos.int= rgenepos.int %>% mutate(chrnumber= sapply(rgenepos.int %>% pull(seqnames), function(x) substr(x, 4,7), USE.NAMES=F), rank=nrow(rgenepos.int):1, is.tf=sapply(rgenepos.int %>% pull(gene_name), function(x) x %in% tfList, USE.NAMES=F) )
+
+##merge chromosomal position and 
+fulltable=rgenepos.int %>% left_join( filteredcluscors[rgenes %>% names,] %>% mutate(gene_name=rgenes %>% names), .)  %>% col2names(., col="gene_name")
+
+
+simpleCache(paste_("rgenepos_int_sampled", cells.per.condition,"cells_parset", wparsel,  varname, tag, "cluster", clu, "numtop", numtop, "alpha", alph, "mincor", mincor, "cormethod", cormethod, datte.mutscore), {rgenepos.int}, assignToVar="rgenepos.int", reload=T)
+simpleCache(paste_("fulltable_int_sampled", cells.per.condition, "cells_parset_",wparsel,  varname, tag, "cluster", clu, "numtop", numtop, "alpha", alph, "mincor", mincor, "cormethod", cormethod,datte.mutscore ), {fulltable}, assignToVar="fulltable", reload=T)
+
+rgenes=rgenepos.int %>% rownames 
+  
+is17=function(x){ if(!is.na(x) && x==17){return(TRUE)}else{return(FALSE)}}
+is1=function(x){ if(!is.na(x) && x==1){return(TRUE)}else{return(FALSE)}}
+annrow=rgenes  %>% as.data.frame %>% givecolnames(.,1, "gene") %>% col2names(., col="gene")  
+annrow[[varname]]=clu
+annrow= annrow %>% mutate(chr17= sapply(fulltable %>% pull(chrnumber), is17, USE.NAMES=F), chr1= sapply(fulltable %>% pull(chrnumber), is1, USE.NAMES=F) )
+
+################################################################################  
+####plotting block
+################################################################################
+  
+
+fcat("ligands found: ", paste(ligands, collapse=","))
+fcat("receptors found: ", paste(receptors, collapse=","))
+fcat("lrpairs found: ", paste(lrpairs, collapse=","))
+
+
+nm=paste_("wpheatmap_nnmutscore_parset",wparsel, "nbrs", neighborchoice, "downsampled", cells.per.condition, varname, tag, "cluster", clu, "numtop", numtop, "alpha", alph,"cormethod", cormethod, "mincor", mincor, "nk", nk, "analysisversion", datte.mutscore)
+    tpdf(path=params$plotpath, nm, width=pw*wex*sca, height=pw*hex*sca)#, res=600)
+  poscolor="dark red"
+  posarray= c(poscolor, "white")
+  names(posarray)= c(TRUE, FALSE)
+  allcolors[["chr17"]]=posarray
+  allcolors[["chr1"]]=posarray
+  
+
+pwtness=ComplexHeatmap::pheatmap(mat3[geneguide %>% names, ],
+                                   scale="row",
+                                   annotation_colors=allcolors,
+                                   cluster_row=FALSE,                                 
+                                   cluster_col=FALSE,
+                                   show_colnames=F,
+                                   border_color=NA,
+                                   show_rownames=F,
+                                  gaps_row=rowgaps,
+                                  breaks=br, 
+                                  annotation_names_row=F,
+                                  use_raster=T,
+  main=clu,
+        col=colls,
+        annotation_col=recode_order2[dscells, ] %>% select(ccondition),
+                                   annotation_row=  annrow %>% select(-gene) %>% select(-(!!sym(varname))),  
+                               right_annotation=ha
+                                   )
+      
+      
+print(
+      pwtness
+)    
+
+  dev.off()
+fcat("figure stored in ", nm, ".png")
+list(rgenes=rgenes, neworder, cluster=clu, cachename=stri, postable=fulltable)
+}) %>% givename(., cluss)
+
+
+allcors = allcors %>% givename(., cluss)
+removerownames= function(x){
+  
+  rownames(x)=NULL
+  x
+}
+
+
+fwrite(lapply(allcors, function(x) x$postable %>% removerownames %>% mutate(cluster=x$cluster)) %>% Reduce(rbind, .), file=file.path(params$plotpath, timestamp(paste_("knnmutaverage_clusters_table_version_", datte.mutscore,".csv"))))
+
+```
+
+distribution of MYCN levels across different variables
+```{r, fig.width=3, fig.width=8}
+varrs= c("stage","mutant.clusters","roi")
+
+ismycn=Vectorize(function(x) if(grepl("MYCN", x)){ return("c17q1qMYCN")} else{ return("non.MYCN")}, USE.NAMES=F)
+allcolors[["mycn.status"]]=c( non.MYCN="white", c17q1qMYCN="magenta")
+
+#filtering only days with mycn
+genesma=join_meta_exp(sma, assay="sctscvi", genes=c("MYCN", "GAPDH", "ACTB"))  %>% filter(stage %in% (allcolors[["stage"]] %>% names)) %>% mutate(MYCN.ACTB=MYCN/ACTB, MYCN.GAPDH=MYCN/GAPDH)  %>% mutate(mycn.status=ismycn(ccondition))
+
+```
+
+plot mycn levels normalised by the levels of ACTB per cell across several groupings
+
+```{r, fig.height=1.5, fig.width=7}
+allplots=lapply( varrs, function(varr){
+  fillvar="mycn.status"
+ggplot(genesma, aes(x=factor(!!sym(varr),levels=allcolors[[varr]] %>% names), fill=factor(!!sym(fillvar), levels=allcolors[[fillvar]] %>% names), y=MYCN.ACTB))+geom_violin(adjust=5)+scale_fill_manual(values=allcolors[[fillvar]])+
+  theme_classic()
+}) 
+
+allplots
+
+```
+
+# Module score of the original WTclusters across the full dataset.
+
+```{r, fig.width=8, fig.height=8}
+sma=AddModuleScore(sma, features=wtcellinfo$markerlist, name=wtcellinfo$markerlist %>% names)
+
+signames=  lapply(1:length(wtcellinfo$markerlist %>% names), function(x) paste0( names(wtcellinfo$markerlist)[[x]], x)) %>% Reduce(c, .)
+
+cmpanel=lapply(signames, function(x){
+FeaturePlot(sma, features=x, reduction=ur, raster=T)+NoAxes()
+}) %>% Reduce('+', .)+plot_layout(nrow=4, ncol=4)
+
+sca=2
+tpdf(path=params$plotpath, "UMAP_full_wtmarker_strength", wi=pw*sca, he=pw*sca)
+print(cmpanel)
+
+dev.off()
+```
+
+
+figuredata, and archiving wild type and full dataset, removing unnecessary metadta variables and assays.
+
+```{r}
+
+metadata.cols=c("orig.ident", "nCount_RNA", "nFeature_RNA", "Row", "Barcode", 
+ "stage", "replicate", 
+"percent.mt", "counts.cutoff", "features.cutoff", "mito.cutoff", 
+"qcc.pass", "scDblFinder.doubletrate", "dbcutoff", "isemptydroplet", 
+"emptydrops.fdr", "ccvar", "Phase", "S.Score", "G2M.Score", "is.doublet", 
+"scDblFinder.dbrate", "scdblscore", "dayds",  
+"ccondition",  
+ "nCount_SCT", "nFeature_SCT", 
+"SCT_snn_res.0.8", 
+"nCount_sctscvi", "nFeature_sctscvi",  
+"mapfun_fate2", "mapfun_fate2_predicted.id.score", "mapfun_fate2_mapping.score", 
+"predicted.id", "predicted.id.score", "kamenevatype", 
+"mapfun_janskytype", "mapfun_janskytype_predicted.id.score", 
+"mapfun_janskytype_mapping.score",  "mutant.clusters", 
+ "ccondition_entropy",  "nnmutscore", 
+"type3", "SCP1", "sympathoblasts2", "mesenchyme3", "intermediate_mesoderm4", 
+"melanocytes5", "endothelium6", "stemcells7", "cortex8", "erythroid9", 
+"kidney10", "chromaffin11", "WT.clusters", 
+"mapfun_stage", "mapfun_stage_predicted.id.score", "mapfun_WT.clusters", 
+"mapfun_WT.clusters_predicted.id.score")
+
+
+
+metadata.cols.wt=c("orig.ident", "nCount_RNA", "nFeature_RNA", "Row", "Barcode", 
+ "stage", "replicate", 
+"percent.mt", "counts.cutoff", "features.cutoff", "mito.cutoff", 
+"qcc.pass", "scDblFinder.doubletrate", "dbcutoff", "isemptydroplet", 
+"emptydrops.fdr", "ccvar", "Phase", "S.Score", "G2M.Score", "is.doublet", 
+"scDblFinder.dbrate", "scdblscore", "dayds",  
+"ccondition",  
+ "nCount_SCT", "nFeature_SCT", 
+"SCT_snn_res.0.8", 
+"nCount_sctscvi", "nFeature_sctscvi",  
+"mapfun_fate2", "mapfun_fate2_predicted.id.score", "mapfun_fate2_mapping.score", 
+"predicted.id", "predicted.id.score", "kamenevatype","type3","SCP1", "sympathoblasts2", "mesenchyme3", "intermediate_mesoderm4", 
+"melanocytes5", "endothelium6", "stemcells7", "cortex8", "erythroid9", 
+"kidney10", "chromaffin11", "WT.clusters")
+
+sma@meta.data= sma %>% metadata %>% dplyr::select(all_of(metadata.cols))
+
+
+scwt@meta.data= scwt %>% metadata %>% dplyr::select(all_of(metadata.cols.wt))
+
+
+sma@meta.data=sma@meta.data %>%  mutate(mapfun_kameneva=mapfun_fate2, mapfun_kameneva_predicted.id.score=mapfun_fate2_predicted.id.score, mapfun_kameneva_mapping.score=mapfun_fate2_mapping.score) %>% select(!mapfun_fate2) %>% select( !mapfun_fate2_mapping.score) %>% select( !mapfun_fate2_predicted.id.score)  %>% select(orig.ident, nCount_RNA, nFeature_RNA, Barcode, stage, replicate, percent.mt, counts.cutoff, features.cutoff, mito.cutoff, qcc.pass, dbcutoff, isemptydroplet, emptydrops.fdr, ccvar, Phase, S.Score, G2M.Score, is.doublet, dbcutoff, scDblFinder.dbrate, scdblscore, dayds, ccondition, nCount_sctscvi, nFeature_sctscvi, mapfun_kameneva, mapfun_kameneva_predicted.id.score, mapfun_kameneva_mapping.score, kamenevatype,type3, mapfun_janskytype, mapfun_janskytype_predicted.id.score, mapfun_janskytype_mapping.score,WT.clusters, mapfun_WT.clusters, mapfun_WT.clusters_predicted.id.score, mutant.clusters, ccondition_entropy, nnmutscore, SCP1, sympathoblasts2, mesenchyme3, intermediate_mesoderm4, melanocytes5, endothelium6, stemcells7, cortex8, erythroid9, kidney10, chromaffin11, mapfun_stage, mapfun_stage_predicted.id.score)
+
+
+saveRDS(sma, file="~/mnt_out/ncnb2/geo_ncnb2_2024/copied_files/full_dataset_curated_metadata.rds")
+
+
+
+
+
+simpleCache("seurat_WT_processed_clusters_markers", {scwt}, 
+            #recreate=T,
+            reload=T,
+            assignToVar="scwt")
+
+
+scwt@meta.data=scwt@meta.data %>% select(orig.ident, nCount_RNA, nFeature_RNA, Barcode,
+                                         stage, replicate, percent.mt, counts.cutoff, features.cutoff,
+                                         mito.cutoff, qcc.pass, dbcutoff,
+                                         isemptydroplet, emptydrops.fdr, ccvar, Phase, S.Score,
+                                         G2M.Score, is.doublet, scDblFinder.dbrate, scdblscore,
+                                          dayds, ccondition,
+        nCount_sctscvi, nFeature_sctscvi, mapfun_fate2, mapfun_fate2_predicted.id.score,                                 
+mapfun_fate2_mapping.score,
+                                         kamenevatype, type3, SCP1, sympathoblasts2, mesenchyme3,
+intermediate_mesoderm4, melanocytes5, endothelium6, stemcells7,
+                                         cortex8, erythroid9, kidney10, chromaffin11, WT.clusters                                         
+) %>% mutate(mapfun_kameneva=mapfun_fate2, mapfun_kameneva_predicted.id.score=mapfun_fate2_predicted.id.score, mapfun_kameneva_mapping.score=mapfun_fate2_mapping.score) %>% select(!mapfun_fate2) %>% select( !mapfun_fate2_mapping.score) %>% select( !mapfun_fate2_predicted.id.score)  
+
+
+################################################################################
+# metadata table for R2
+################################################################################
+r2label<-""
+
+write.table(scwt@meta.data, file=paste("~/mnt_out/ncnb2/", r2label,"_final_","meta.txt", sep = ""), sep='\t', col.names=NA)
+dir()
+
+
+saveRDS(scwt, file="~/mnt_out/ncnb2/geo_ncnb2_2024/copied_files/seurat_wt_dataset.rds")
+
+saveRDS(DietSeurat(scwt, assays=c("RNA","sctscvi"), dimreducs=c("scvi", "umap.fullscvi8", "wtumap.fullscvi822", "pca")), file="/path/to/seurat_wt_dataset_diet.rds")
+sma@meta.data= sma %>% metadata %>% dplyr::select(all_of(metadata.cols))
+
+
+sma=readRDS( file=file.path(params$outpath, "full_dataset_entire_metadata.rds"))
+```
+
+
+Create loupe file
+
+
+```{r}
+
+create_loupe(count_mat = sma@assays$sctscvi@data,
+             output_name = "full_dataset",
+             output_dir = "~/mnt_out/geo_ncnb2_2024/copied_files/",
+             clusters = sma@meta.data[c("mutant.clusters", "WT.clusters")] %>% c %>% lapply(as.factor),
+             projections = list(umap = Embeddings(sma,"umap.fullscvi8")[, 1:2],
+                                scvi=Embeddings(sma,"scvi")[,1:10])
+             )
+
+```
+
+## Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```

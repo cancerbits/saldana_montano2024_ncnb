@@ -1,0 +1,376 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Data loading and QC' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we read in the ATAC-seq data (sample information, peak coordinates, read counts per peaks) and convert them into objects that can be readily used in downstream analyses.
+We also load in some pre-processed parts of the scRNA-seq analysis for comparisons.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(DESeq2)
+```
+
+Functions, constants, etc. specifically used in this notebook.
+
+```{r}
+
+sampleOverviewPlot <- function(dA) {
+  ggplot(dA[,.N,by=.(day_fac, condition_fac)], aes(x=day_fac, y=condition_fac)) + geom_tile(aes(fill=N)) + geom_text(aes(label=N)) + viridis::scale_fill_viridis() + scale_y_discrete(limits=rev(CONDITION_ORDER)) + xlab("Differentiation stage [day]") + ylab("Cell line / condition") + cowplot::theme_cowplot()
+}
+
+ATAC_BLACKLIST_URL <- "http://mitra.stanford.edu/kundaje/akundaje/release/blacklists/hg38-human/hg38.blacklist.bed.gz"
+ATAC_MIN_COUNTS <- 10
+ATAC_MIN_SAMPLES <- 3
+ATAC_NORM_CHROMS = paste0("chr",c(2:16, 18:22))
+
+```
+
+
+
+
+
+# ATAC-seq
+
+## Sample metadata
+
+Load sample annotation and derive metadata columns:
+
+```{r load_meta}
+# 
+dA <- fread(metaDir("samples_atac.csv"))
+dA[, condition:=cellline_short]
+dA[, cell_line:=NULL]
+dA[, cellline_short:=NULL]
+dA[, condition_fac:=factor(condition, levels=CONDITION_ORDER)]
+dA[, day_fac:=factor(paste0("D",day), levels=DAY_ORDER)]
+setkey(dA, "library_name")
+```
+
+Define preferred order of listing samples:
+
+```{r}
+dA[order(condition_fac, day_fac, batch), sample_order := 1:.N]
+```
+
+
+Add pipeline-level quality metrics:
+
+```{r}
+pipeStats <- fread(pipelineDir("ncnb_atacseq_stats_summary.tsv"))[,.(pipe_name=sample_name, Raw_reads, Trimmed_reads, Mapped_reads, Aligned_reads, Dedup_aligned_reads, Mitochondrial_reads, Peak_count, NRF, PBC1, PBC2, FRiP)]
+dA <- merge(dA, pipeStats[, .(pipe_name, total_reads=Raw_reads, aligned_reads=Aligned_reads, FRiP, NRF, PBC1, PBC2)], by="pipe_name")
+```
+
+Define QC filters (ENCODE standards):
+
+```{r}
+dA[, qc:= NRF>0.65 & PBC1 > 0.7 & PBC2 > 1 & FRiP>0.025]
+
+print(dA[rm==T | qc==F, .(qc, rm, library_name)])
+
+print(dA)
+```
+
+Print table summary before and after remove low-quality sample(s):
+
+```{r sample_overview}
+print(sampleOverviewPlot(dA) + ggtitle("Before QC"))
+dA <- dA[qc==TRUE, ]
+print(sampleOverviewPlot(dA) + ggtitle("After QC"))
+```
+
+
+
+## Peaks 
+
+Read in all peaks called in any sample:
+
+```{r load_peaks}
+umPeaksDt <- rblapply(dA[, getPeaksPath(pipe_name)], fread, "f")
+umPeaksDt <- umPeaksDt[V1%in%CHROM_ORDER, ]	# remove peaks on unassigned, variant, Y chromosome, ..
+umPeaks <- with(umPeaksDt, GenomicRanges::GRanges(V1, IRanges::IRanges(V2,V3)))
+print(umPeaks)
+
+peakNum <- rblapply(dA[, pipe_name], function(pipe_name) fread(getPeaksPath(pipe_name)), "pipe_name")[,.N,by=pipe_name]
+plotData <- melt(merge(peakNum, dA, by="pipe_name"), measure.vars=c("condition", "day_fac"))
+print(ggplot(plotData, aes(x=reorder(library_name,-N), y=N, fill=value)) + geom_bar(stat="identity") + defTheme(flipX=T) + xlab(NULL) + facet_wrap(~variable, ncol=1) + ylab("Number of peaks") + ggtitle("Peak number before merging"))
+```
+
+Merge overlapping peaks:
+
+```{r}
+peaks <- reduce(umPeaks)
+print(peaks)
+```
+
+Remove blacklisted regions (see https://sites.google.com/site/anshulkundaje/projects/blacklists):
+
+```{r}
+overlapBlacklist <- rep(FALSE, length(peaks))
+if(!is.null(ATAC_BLACKLIST_URL)) {
+  blacklistFile <- getExternalFile("hg38.blacklist.bed.gz", ATAC_BLACKLIST_URL)
+	blacklist <- with(fread(blacklistFile), GRanges(V1,IRanges(V2,V3)))
+	overlapBlacklist <- countOverlaps(peaks, blacklist)>0
+}
+peaks <- peaks[!overlapBlacklist]
+
+peaksDt <- grToDt(peaks)
+peaksDt[,rid:=paste0("r", 1:nrow(peaksDt))] # assign a unique ID to each peak
+```
+
+Annotate each merged peak with the matching source peaks:
+
+```{r}
+setkey(dA, library_name)
+tmp <- sapply(dA$library_name, function(s) {
+	(GenomicRanges::countOverlaps(dtToGr(peaksDt), umPeaks[umPeaksDt[,f==dA[s, getPeaksPath(pipe_name)]],])>0)*1
+})
+```
+
+Pack all peak info in a big table:
+
+```{r}
+peaksDt <- cbind(peaksDt, tmp)
+plotData <- melt(peaksDt, variable.name="library_name", measure.vars=dA$library_name)[value==1, .N, by=library_name]
+plotData <- cbind(plotData, dA[as.character(plotData$library_name),.(day_fac,condition)])
+plotData <- melt(plotData, measure.vars=c("condition", "day_fac"))
+print(ggplot(plotData, aes(x=reorder(library_name,-N), y=N, fill=value)) + geom_bar(stat="identity") + defTheme(flipX=T) + xlab(NULL) + facet_wrap(~variable, ncol=1) + ylab("Number of peaks") + ggtitle("Peak number after merging"))
+
+print(head(peaksDt))
+print(nrow(peaksDt))
+peaksDt <- peaksDt[, .(rid, chrom, start, end)]
+setkey(peaksDt,rid)
+
+setkey(peaksDt,rid)
+
+print(head(peaksDt))
+```
+
+
+## Counts
+
+Calculate raw read counts per peak:
+
+```{r calculate_counts}
+dCounts <- versionedCache("atac_counts", instruction={ # N.B. we cache the results, because the calculation takes a little while
+  peaksSAF <- as.data.frame(peaks_dt[,.(GeneID=rid, Chr=chrom, Start=start, End=end, Strand="*")])
+  
+  # use featureCounts to sum up the number of reads overlapping each peak per sample:
+  fc <- Rsubread::featureCounts(files=getBamPath(annot$pipe_name), annot.ext=peaksSAF, isGTFAnnotationFile=FALSE, useMetaFeatures=TRUE, allowMultiOverlap=TRUE, countMultiMappingReads=FALSE, largestOverlap=FALSE, nthreads=config$n_threads_max, strandSpecific=0, isPairedEnd=FALSE)
+  dCounts <- fc$counts
+  
+  # replace column names to match annotation file:
+  annot[, bam_base := basename(getBamPath(annot$pipe_name))]
+  setkey(annot, "bam_base")
+  colnames(dCounts) <- annot[colnames(dCounts), library_name] 
+  setkey(annot, "library_name")
+  
+  # peaks with good coverage only:
+  i <- rowSums(dCounts>=min_counts) >= min_samples
+  dCounts <- dCounts[i, ]	
+  
+  dCounts
+  
+}, buildEnvir=list(
+    annot=dA[,.(library_name, pipe_name)],
+    peaks_dt=peaksDt[,.(rid, chrom, start, end)],
+    min_counts=ATAC_MIN_COUNTS,
+    min_samples=ATAC_MIN_SAMPLES
+))
+```
+
+Filter out any reference peaks with any counts:
+
+```{r}
+peaksDt <- peaksDt[rid %in% rownames(dCounts), ]
+print(head(dCounts))
+```
+
+
+## Models
+
+Prepare DESeq2 models (these will be used later on to normalize read counts):
+
+```{r prepare_dds}
+dds <- versionedCache(CACHE_ATAC_DDS, instruction={
+	cData <- dtToDf(dA[,.(library_name,sample_group,lane,batch)])[colnames(dCounts),,drop=F] #,condition,stage
+	cData$batch <- as.factor(cData$batch)
+	cData$lane <- as.factor(cData$lane)
+	
+	# create model:
+	dds <- DESeq2::DESeqDataSetFromMatrix(countData = dCounts,
+								  colData = cData,
+								  design = ~lane+batch+sample_group)
+	
+	# use only peaks on non-aberrant chromosomes:	
+	i <- peaksDt[rownames(dCounts),][, chrom%in%ATAC_NORM_CHROMS]
+	dds <- estimateSizeFactors(dds, controlGenes=i)
+		
+	# run the main DESeq workflow:
+	dds <- DESeq2::DESeq(dds)
+	
+	return(dds)
+}, timer=TRUE, buildEnvir=list(
+  dA=dA[,.(library_name,sample_group,lane,batch)],
+  dCounts=dCounts
+))
+
+print(dds)
+```
+
+
+## Save
+
+Save peaks and metadata ready for reuse in other parts of the analysis:
+
+```{r save_caches}
+dA <- versionedCache(CACHE_ATAC_META, instruction={
+  setkey(annot, library_name)
+  annot
+}, buildEnvir=list(annot=dA))
+
+peaksDt <- versionedCache(CACHE_ATAC_PEAKS, instruction={
+  setkey(peaks_dt, rid)
+  peaks_dt
+}, buildEnvir=list(peaks_dt=peaksDt))
+```
+
+
+
+# Auxiliarydata
+
+# Load selected inputs from preceding scRNA-seq analysis
+
+Load in the list of marker genes for each cluster (from Fig. 1):
+
+```{r load_scrna_markers}
+scMarkers <- versionedCache(CACHE_SCRNA_MARKERS, instruction={
+  simpleCache::simpleCache(in_cache, assignToVar='sc', reload=T)
+  return(as.data.table(reshape2::melt(sc$markerlist))[,.(cmp="WT", cluster_id=L1, gene_symbol=value)])
+}, recreate=F, buildEnvir=list(
+  in_cache="wtheatmap_clusterinfo_genes_lfct_1_numtop_250minrate0.5_2023-10-19seriationmethodseuratncells300"
+))
+
+print(head(scMarkers))
+```
+
+Processed single-cell data:
+
+```{r load_scrna_data}
+inCache <- "sma_fulldataset_with_mutscore_D9_D14_D19"
+dUse <- "sctscvi"
+redUse <- "umap.fullscvi8"
+
+# data and metadata:
+scDataF <- versionedCache(CACHE_SCRNA_DATA, instruction={
+  simpleCache::simpleCache(in_cache, assignToVar='sc', reload=T)
+	return(list(
+		d=sc@assays[[d_use]]@data, 
+		meta=sc@meta.data
+	))
+}, buildEnvir=list(in_cache=inCache, d_use=dUse))
+
+scDataF <- latestCache(CACHE_SCRNA_DATA)
+
+# aggregated by condtion/replicates:
+scDataAgg <- versionedCache(CACHE_SCRNA_DATA_AGGREGATED, instruction={
+  dUse <- "sctscviwt"
+	simpleCache::simpleCache(in_cache, assignToVar='sc', reload=T)
+	sc@meta.data$sample_group <- paste_(
+	    gsub("c","",sc@meta.data$ccondition), 
+	    sc@meta.data$stage, 
+	    gsub("R","",sc@meta.data$replicate)
+	)
+	tmp <- Seurat::AggregateExpression(sc, assays=d_use, group.by="sample_group")[[1]]
+	tmp <- DESeq2::vst(round(tmp))
+	return(tmp)
+}, buildEnvir=list(in_cache=inCache, d_use=dUse))
+
+# names of expressed genes:
+expressedGenes <- versionedCache(CACHE_SCRNA_EXPR, instruction={
+  dUse <- "sctscviwt"
+	simpleCache::simpleCache(in_cache, assignToVar='sc', reload=T)
+	sc@meta.data$sample_group <- paste_(
+	    gsub("c","",sc@meta.data$ccondition), 
+	    sc@meta.data$stage, 
+	    gsub("R","",sc@meta.data$replicate)
+	)
+	tmp <- Seurat::AggregateExpression(sc, assays=d_use, group.by="sample_group")[[1]]
+	
+	rownames(tmp)[apply(tmp,1,max)>=quantile(tmp,0.5)]
+}, buildEnvir=list(in_cache=inCache, d_use=dUse))
+
+# UMAP coordinates:
+scDataUMAP <- versionedCache(CACHE_SCRNA_UMAP, instruction={
+  simpleCache::simpleCache(in_cache, assignToVar='sc', reload=T)
+	return(sc@reductions[[red_use]]@cell.embeddings)
+}, buildEnvir=list(in_cache=inCache, red_use=redUse))
+
+# mutation scores:
+metaMutScore <- versionedCache(CACHE_SCRNA_MUT_SCORE, instruction={
+	simpleCache::simpleCache(in_cache, assignToVar='x', reload=T)
+ x <- as.data.table(x@meta.data, keep.rownames="cell_id")[!is.na(nnmutscore), .(cell_id, nnmutscore, stage, ccondition)]
+	setkey(x, cell_id)
+	return(x)
+}, recreate=F, buildEnvir=list(in_cache=inCache))
+
+print(head(scDataF$meta))
+print(head(scDataUMAP))
+print(head(metaMutScore))
+```
+
+Load mutation-score-associated genes:
+
+```{r load_scrna_mutgenes}
+mutGenes <- versionedCache(CACHE_SCRNA_MUT_GENES, instruction={
+  simpleCache::simpleCache(in_cache, assignToVar='mutGenes', reload=T)
+  mutGenes <- as.data.table(mutGenes)
+  
+  mutGenes[, stage := gsub("^.+cluster_(D\\d+)_.+$","\\1",in_cache)]
+  mutGenes[, grp := paste_(stage, tclus)]
+  mutGenes[,.N,by=grp]
+  return(mutGenes[, .(grp, stage, gene, rank)])
+}, recreate=F, buildEnvir=list(in_cache="fulltable_int_sampled_1000_cells_parset__3_stage_method3_highcor0p3_cluster_D9_numtop_300_alpha_0.05_mincor_0.3_cormethod_pearson_20240124-1"))
+
+print(mutGenes)
+print(table(mutGenes$grp))
+```
+
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

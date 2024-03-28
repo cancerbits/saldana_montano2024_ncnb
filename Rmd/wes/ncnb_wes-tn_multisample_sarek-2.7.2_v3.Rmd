@@ -1,0 +1,399 @@
+---
+title: "NCNB WES Sarek-2.7.2 T-N-matched Variants Processing v3"
+author: "Peter Zoescher"
+date: "11/15/2023"
+output: html_document
+---
+
+```{r install, echo=F, eval=F}
+# to be run in ccribioinf/dockrstudio:4.0.3-v1
+# dockerhub manifest digest: sha256:055a81938337a3fc2a15039476094058f5691e02b529578041af508352264323
+
+if (!require("BiocManager", quietly = TRUE))
+    install.packages("BiocManager")
+# Bioconductor version 3.12 (BiocManager 1.30.10), R 4.0.3 (2020-10-10)
+
+BiocManager::install("GenomicRanges", version="3.12", update = FALSE)
+# > packageVersion("GenomicRanges")
+# [1] ‘1.42.0’
+```
+
+```{r libraries, echo=F, warning=F}
+suppressPackageStartupMessages(library(tidyr))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(magrittr))
+suppressPackageStartupMessages(library(GenomicRanges))
+suppressPackageStartupMessages(library(data.table))
+
+library(tidyr)
+library(dplyr)
+# magrittr is needed to interpret %>%
+library(magrittr)
+library(GenomicRanges)
+library(data.table)
+
+source("R/wes/Sarek-2.7.2OutputParsers_v1.4.R")
+source("R/wes/wes_processing_v0.2.R")
+```
+
+```{r settings, echo=T}
+in_path <- "/path/to/r_input/"
+out_path <- "/path/to/r_output/"
+
+samples <- c("17q", "17q1q", "17q-MYCN", "H7S14-MYCN", "S_17q_MYCN_D19_t_wes", "S_17q_MYCN_DOX_D19_t_wes", "S_17q1q_MYCN_D19_t_wes", "S_17q1q_MYCN_DOX_D19_t_wes", "WT_MYCN_D19_t_wes", "WT_MYCN_DOX_D19_t_wes")
+caller <- c("Mutect2_filtered", "StrelkaBP")
+
+# The size of the connection buffer (131072) was not large enough
+Sys.setenv("VROOM_CONNECTION_SIZE" = 131072 * 2)
+```
+
+### Generate Data
+
+```{r load vcfs, echo=F, message=F, warning=F}
+start.time <- Sys.time()
+
+all_tn_smlv_vcf_list = list()
+
+for(sample in samples){
+  
+  ### MUTECT2 AND STRELKABP ###
+  tn_sample_paths <- c()
+  tn_smlv_vcf_list = list()
+  
+  for(cal in caller){
+    tn_sample_paths <- c(tn_sample_paths, intersect(list.files(in_path, pattern=".*_vs_.*", full.names=TRUE, recursive=TRUE), 
+                                                    list.files(in_path, pattern=paste0(cal, "_", sample, "_vs_.*", ".norm.ann.vcf(\\.gz)?$"), full.names=TRUE, recursive=TRUE)))
+  }
+  
+  for(tn_sample_path in tn_sample_paths){
+    if(grepl("Mutect2", tn_sample_path)){
+      varcal_tool <- "Mutect2"
+      vcf_df <- parse_paired_mutect2(tn_sample_path)
+      vcf_raw_obj <- readr::read_lines(tn_sample_path)
+      csq_line <- vcf_raw_obj[grep("##.*ID=CSQ", vcf_raw_obj)]
+      stringr::str_sub(csq_line, nchar(csq_line)-1, nchar(csq_line)) <- ""
+      vep_colnames <- strsplit(sub(".*Format: ", "", csq_line), "\\|")[[1]]
+      vcf_df <- vcf_df %>% 
+        #CSQ is the VEP annotation column
+        #annotations for multiple transcripts are separated by ","
+        tidyr::separate_rows(., CSQ, sep = ",") %>%
+        #within one annotation, fields are separated by "|"
+        separate(CSQ, vep_colnames, sep = "\\|")
+    }else if(grepl("StrelkaBP", tn_sample_path)){
+      # Strelka snv and indel outputs need to be processed differently
+      if(grepl("_somatic_snvs_", tn_sample_path)){
+        varcal_tool <- "Strelka_snv"
+        vcf_df <- parse_strelka_snv_t1(tn_sample_path)
+        vcf_raw_obj <- readr::read_lines(tn_sample_path)
+        csq_line <- vcf_raw_obj[grep("##.*ID=CSQ", vcf_raw_obj)]
+        stringr::str_sub(csq_line, nchar(csq_line)-1, nchar(csq_line)) <- ""
+        vep_colnames <- strsplit(sub(".*Format: ", "", csq_line), "\\|")[[1]]
+        vcf_df <- vcf_df %>% 
+          #CSQ is the VEP annotation column
+          #annotations for multiple transcripts are separated by ","
+          tidyr::separate_rows(., CSQ, sep = ",") %>%
+          #within one annotation, fields are separated by "|"
+          separate(CSQ, vep_colnames, sep = "\\|")
+      }else if(grepl("_somatic_indels_", tn_sample_path)){
+        varcal_tool <- "Strelka_indel"
+        vcf_df <- parse_strelka_indel_t1(tn_sample_path)
+        vcf_raw_obj <- readr::read_lines(tn_sample_path)
+        csq_line <- vcf_raw_obj[grep("##.*ID=CSQ", vcf_raw_obj)]
+        stringr::str_sub(csq_line, nchar(csq_line)-1, nchar(csq_line)) <- ""
+        vep_colnames <- strsplit(sub(".*Format: ", "", csq_line), "\\|")[[1]]
+        vcf_df <- vcf_df %>% 
+          #CSQ is the VEP annotation column
+          #annotations for multiple transcripts are separated by ","
+          tidyr::separate_rows(., CSQ, sep = ",") %>%
+          #within one annotation, fields are separated by "|"
+          separate(CSQ, vep_colnames, sep = "\\|")
+      }
+    }
+    vcf_df$file <- tn_sample_path
+    #add tool info to var entry (based on sarek filename)
+    vcf_df$tool <- varcal_tool
+    
+    #add sample info to var entry
+    vcf_df$sample <- sample
+    
+    tn_smlv_vcf_list[[varcal_tool]] <- type.convert(vcf_df)
+  }
+  all_tn_smlv_vcf_list[[sample]] <- tn_smlv_vcf_list
+}
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+### Process Data
+
+``` {r whitelisting add column, echo=F, message=F, warning=F}
+# we add all whitelists
+
+# CCRI-internal NB whitelist (Liquid Biopsies and Tarpan project)
+NB <- read.csv(file="/path/to/ncnb2_code/metadata/ensids_NBwhitelist_dummy.tsv",
+                        header=TRUE, sep="\t")
+
+# Bailey et al 2018, genes carrying pan-tumor driver mutations that induce AA change.
+bailey2018 <- read.csv(file="/path/to/ncnb2_code/metadata/ensids_bailey2018_220629.tsv",
+                        header=TRUE, sep="\t")
+
+nb_wl_gr <- sort(makeGRangesFromDataFrame(NB,
+                                           keep.extra.columns=TRUE,
+                                           ignore.strand=FALSE,
+                                           seqinfo=NULL,
+                                           seqnames.field=c("SEQNAME"),
+                                           start.field="GENESEQSTART",
+                                           end.field=c("GENESEQEND"),
+                                           strand.field="strand",
+                                           starts.in.df.are.0based=FALSE))
+
+pan_wl_gr <- sort(makeGRangesFromDataFrame(bailey2018,
+                                           keep.extra.columns=TRUE,
+                                           ignore.strand=FALSE,
+                                           seqinfo=NULL,
+                                           seqnames.field=c("SEQNAME"),
+                                           start.field="GENESEQSTART",
+                                           end.field=c("GENESEQEND"),
+                                           strand.field="strand",
+                                           starts.in.df.are.0based=FALSE))
+
+start.time <- Sys.time()
+
+all_tn_smlv_wl_list = list()
+
+for(sample in samples){
+  tn_smlv_vcf_list <- all_tn_smlv_vcf_list[[sample]]
+
+  tn_smlv_wl_list <- list()
+  for(vcf in tn_smlv_vcf_list){
+    varcal_tool <- as.character(vcf$tool[1])
+    smlv_gr <- makeGRangesFromDataFrame(vcf,
+                                     keep.extra.columns=TRUE,
+                                     ignore.strand=TRUE,
+                                     seqnames.field="CHROM",
+                                     start.field="POS",
+                                     end.field="POS",
+                                     starts.in.df.are.0based=FALSE)
+    smlv_gr <- addWlColumnToGr(smlv_gr, nb_wl_gr, "NB_WL")
+    smlv_gr <- addWlColumnToGr(smlv_gr, pan_wl_gr, "PAN_WL")
+
+    tn_smlv_wl_list[[varcal_tool]] <- as.data.frame(smlv_gr)
+  }
+  all_tn_smlv_wl_list[[sample]] <- tn_smlv_wl_list
+}
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+#### filtering
+
+```{r MAPPYACTS new, echo=T}
+start.time <- Sys.time()
+
+all_tn_smlv_wl_filt_list = list()
+filt_in_smlv_list <- all_tn_smlv_wl_list
+
+for(sample in samples){
+  tn_smlv_wl_list <- filt_in_smlv_list[[sample]]
+  
+  tn_smlv_wl_filt_list <- list()
+  for(vcf in tn_smlv_wl_list){
+    varcal_tool <- as.character(vcf$tool[1])
+    tn_smlv_wl_filt_list[[varcal_tool]] <- MAPPYACTS_filter(vcf)
+  }
+  all_tn_smlv_wl_filt_list[[sample]] <- tn_smlv_wl_filt_list
+}
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+### variant whitelists
+
+#### datatable
+
+```{r prepare vcfs as tables, echo=F}
+start.time <- Sys.time()
+
+all_tn_smlv_df_list = list()
+
+for(sample in samples){
+  tn_smlv_wl_filt_list <- all_tn_smlv_wl_filt_list[[sample]]
+  tn_smlv_df_list <- list()
+  for(vcf in tn_smlv_wl_filt_list){
+    varcal_tool <- as.character(vcf$tool[1])
+    vcf <- vcf %>%
+      dplyr::select(-INFO)
+    df <- as.data.frame(vcf)
+    tn_smlv_df_list[[varcal_tool]] <- df
+  }
+  # combine all smlv vcfs into one df
+  tn_smlv_df_rbind <- rbindlist(tn_smlv_df_list, fill=TRUE)
+  all_tn_smlv_df_list[[sample]] <- tn_smlv_df_rbind
+}
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+#### Tiers
+
+```{r custom columns relevant for the tiering, echo=F, message=F, warning=F}
+start.time <- Sys.time()
+
+pop_af <- 0.001
+t_vaf_th <- 0.05
+ex_cons <- c("coding_sequence_variant", "frameshift_variant", "incomplete_terminal_codon", "inframe_deletion", "inframe_insertion", "missense_variant", "protein_altering_variant", "start_lost", "stop_gained", "stop_lost")
+tolerated_MAPPYACTS <- c("PASS", "SOM", "1K_AF", "gnomAD_AF", "MAX_AF")
+
+all_tn_smlv_df_cust_list = list()
+
+for(sample in samples){
+  df <- all_tn_smlv_df_list[[sample]]
+  df_cust <- df %>% 
+    # create a varkey
+    dplyr::mutate(varkey=paste0(seqnames,":",start,REF,">",ALT)) %>%
+    # set a custom population AF filter
+    dplyr::mutate(POP_AF_filter=ifelse(((!is.na(AF) & AF > pop_af) | (!is.na(gnomAD_AF) & gnomAD_AF > pop_af) | (!is.na(MAX_AF) & MAX_AF > pop_af)), "FAIL", "PASS")) %>%
+    # any exonic consequence hit
+    dplyr::mutate(any_ex = strsplit(as.character(Consequence), "&")) %>%
+    dplyr::mutate(any_ex = sapply(any_ex, function(x) any(x %in% ex_cons))) %>%
+    # tier3 in-silico predictor hits
+    dplyr::mutate(isp3=ifelse(((IMPACT == "HIGH" | IMPACT == "MODERATE")
+                              | grepl("probably_damaging", PolyPhen)
+                              | grepl("deleterious", SIFT)), "PASS", "FAIL")) %>%
+    # tier2 in-silico predictor hits
+    dplyr::mutate(isp2=ifelse((IMPACT == "HIGH" 
+                               | grepl("probably_damaging", PolyPhen) 
+                               | grepl("deleterious\\(", SIFT)), "PASS", "FAIL")) %>%
+    # information about presence in any whitelist
+    dplyr::mutate(any_WL=ifelse(rowSums(select(., NB_WL, PAN_WL) >= 1) > 0, 1, 0)) %>%
+    # threshold for the T_VAF column
+    dplyr::mutate(t_vaf_threshold=ifelse(T_VAF > t_vaf_th, "PASS", "FAIL")) %>%
+    # all activated MAPPYACTS filters need to be tolerated
+    dplyr::mutate(MAPPYACTS_PASS = strsplit(MAPPYACTS, ",")) %>%
+    dplyr::mutate(MAPPYACTS_PASS = sapply(MAPPYACTS_PASS, function(x) all(x %in% tolerated_MAPPYACTS)))
+  
+    varkey_hits <- df_cust %>% 
+      dplyr::group_by(varkey, Feature) %>%
+      dplyr::summarise(n_tools = dplyr::n_distinct(tool))
+
+    df_cust <- left_join(df_cust, varkey_hits, by = c("varkey", "Feature"))
+    
+    all_tn_smlv_df_cust_list[[sample]] <- df_cust
+}
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+```{r tiering, echo=F, message=F, warning=F}
+start.time <- Sys.time()
+
+all_tn_smlv_df_cust_ti_list <- list()
+
+for(sample in samples){
+  df_cust <- all_tn_smlv_df_cust_list[[sample]]
+  df_cust_ti <- df_cust %>%
+    # TIER 3
+    dplyr::mutate(TIER3=ifelse(POP_AF_filter == "PASS" &
+                               FILTER == "PASS" &
+                               CANONICAL == "YES" &
+                               any_ex == TRUE &
+                               isp3 == "PASS", 
+                               1, 0)) %>%
+    # TIER 2
+    dplyr::mutate(TIER2=ifelse(TIER3 == 1 &
+                               isp2 == "PASS" &
+                               MAPPYACTS_PASS == TRUE &
+                               t_vaf_threshold == "PASS", 
+                               1, 0)) %>%
+    # TIER 1
+    dplyr::mutate(TIER1=ifelse(TIER2 == 1 &
+                               any_WL == 1, 
+                               1, 0))
+    
+    all_tn_smlv_df_cust_ti_list[[sample]] <- df_cust_ti
+}
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```
+
+# Save Tables
+
+```{r save tables}
+start.time <- Sys.time()
+
+all_tn_smlv_out_list = list()
+all_tn_smlv_out_red_list = list()
+
+for(sample in samples){
+  df_cust_ti <- all_tn_smlv_df_cust_ti_list[[sample]]
+  out <- df_cust_ti %>%
+    # In order to remove duplicated Strelka variants that share the same annotation as the Mutect2 hit we run
+    # dplyr::filter(!(tool == "StrelkaBP" & n_tools > 1)) %>%
+    dplyr::filter(!(grepl("Strelka", tool) & n_tools > 1)) %>%
+    # We only keep FILTER == PASS in the final tables
+    dplyr::filter(FILTER == "PASS") %>%
+    # Sort by TIERs
+    dplyr::arrange(-TIER1, -TIER2, -TIER3)
+  
+  out_red <- out %>%
+    dplyr::select(TIER1, TIER2, TIER3, varkey, SYMBOL, EXON, HGVSp, T_AF, T_ALT_COUNT, T_REF_COUNT, T_VAF, FILTER, MAPPYACTS, POP_AF_filter, CANONICAL, Consequence, IMPACT, SIFT, PolyPhen, isp3, isp2, INTRON, HGVSc, Codons, VARIANT_CLASS, AF, gnomAD_AF, MAX_AF, CLIN_SIG, Existing_variation, SOMATIC, PHENO, PUBMED, DP, tool, NB_WL, PAN_WL, any_WL, t_vaf_threshold, n_tools)
+  
+  all_tn_smlv_out_list[[sample]] <- out
+  all_tn_smlv_out_red_list[[sample]] <- out_red
+}
+
+for(sample in samples){
+  # we store smlv in full and reduced format
+  write.table(all_tn_smlv_out_list[[sample]], file=paste0(out_path, sample,'_smlVars_pass_tiers_full.tsv'), quote=FALSE, sep='\t', col.names = TRUE, row.names = FALSE)
+  write.table(all_tn_smlv_out_red_list[[sample]], file=paste0(out_path, sample,'_smlVars_pass_tiers_reduced.tsv'), quote=FALSE, sep='\t', col.names = TRUE, row.names = FALSE)
+}
+
+# write a single smlv table for all samples for downstream phylogeny analysis
+smlv_all <- type.convert(bind_rows(all_tn_smlv_out_list))
+
+old_names <- c("H7S14-MYCN", 
+               "WT_MYCN_D19_t_wes", 
+               "WT_MYCN_DOX_D19_t_wes", 
+               "17q", 
+               "17q-MYCN", 
+               "S_17q_MYCN_D19_t_wes", 
+               "S_17q_MYCN_DOX_D19_t_wes", 
+               "17q1q", 
+               "S_17q1q_MYCN_D19_t_wes", 
+               "S_17q1q_MYCN_DOX_D19_t_wes")
+new_names <- c("wtMYCN", 
+               "wtMYCN_D19", 
+               "wtMYCN_DOX_D19", 
+               "17q", 
+               "17qMYCN", 
+               "17qMYCN_D19", 
+               "17qMYCN_DOX_D19", 
+               "17q1qMYCN", 
+               "17q1qMYCN_D19", 
+               "17q1qMYCN_DOX_D19")
+
+smlv_all$sample <- as.character(smlv_all$sample)
+smlv_all <- smlv_all %>%
+  mutate(sample = case_when(
+    sample %in% old_names ~ new_names[match(sample, old_names)],
+    TRUE ~ sample
+  ))
+
+write.table(smlv_all, file=paste0(out_path, 'ncnb_smlVars_all_tn_pass_tiers.tsv'), quote=FALSE, sep='\t', col.names = TRUE, row.names = FALSE)
+
+end.time <- Sys.time()
+time.taken <- end.time - start.time
+time.taken
+```

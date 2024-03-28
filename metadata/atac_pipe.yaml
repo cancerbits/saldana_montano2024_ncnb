@@ -1,0 +1,23 @@
+metadata:
+  output_dir: PATH-TO-OUTPUT-DIR
+  results_subdir: OUTPUT-SUBDIR
+  submission_subdir: submission/
+  pipeline_interfaces: $CODEBASE/pipes/looper_config.yaml
+
+subprojects:
+  atacseq:
+    metadata:
+      sample_annotation: samples_atacseq.csv
+
+data_sources:
+  BSF: "PATH-TO-BAM-FILES"
+
+implied_attributes:
+  organism:
+    human:
+      genome: "refdata-gex-GRCh38-2020-A"
+      macs_genome_size: "hs"
+    human_chromatin:
+      genome: "refdata-cellranger-atac-GRCh38-1.2.0"
+
+derived_attributes: [read1, read2, file_path]

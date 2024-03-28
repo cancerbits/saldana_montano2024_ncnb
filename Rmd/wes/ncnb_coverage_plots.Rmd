@@ -1,0 +1,116 @@
+---
+title: "ncnb_coverage_plots"
+author: "Peter Zoescher"
+date: "12/15/2023"
+output: html_document
+---
+
+```{r libraries, echo=F, warning=F}
+# to be run in ccribioinf/dockrstudio:4.0.3-v1
+# dockerhub manifest digest: sha256:055a81938337a3fc2a15039476094058f5691e02b529578041af508352264323
+
+suppressPackageStartupMessages(library(ggplot2))
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(stringr))
+
+library(ggplot2)
+library(dplyr)
+library(stringr)
+```
+
+```{r prepare plots}
+in_path <- "/path/to/r_input/"
+out_path <- "/path/to/r_output/"
+
+old_names <- c("H7S14-MYCN", 
+               "WT_MYCN_D19_t_wes", 
+               "WT_MYCN_DOX_D19_t_wes", 
+               "17q", 
+               "17q-MYCN", 
+               "S_17q_MYCN_D19_t_wes", 
+               "S_17q_MYCN_DOX_D19_t_wes", 
+               "17q1q", 
+               "S_17q1q_MYCN_D19_t_wes", 
+               "S_17q1q_MYCN_DOX_D19_t_wes",
+               "H7S14")
+new_names <- c("wtMYCN", 
+               "wtMYCN_D19", 
+               "wtMYCN_DOX_D19", 
+               "17q", 
+               "17qMYCN", 
+               "17qMYCN_D19", 
+               "17qMYCN_DOX_D19", 
+               "17q1qMYCN", 
+               "17q1qMYCN_D19", 
+               "17q1qMYCN_DOX_D19",
+               "H7S14")
+
+cov_paths <- list.files(in_path, pattern = ".*\\.hs_target_cov", full.names = T)
+
+barplots <- list()
+all_mean_coverages <- list()
+
+for(cov_path in cov_paths){
+  sname <- str_remove(basename(cov_path), ".md.hs_target_cov")
+  new_name <- new_names[match(sname, old_names)]
+
+  coverage <- read.table(cov_path, header = TRUE, sep = "\t")
+  
+  # Calculate mean coverage for each chromosome, excluding 'chrM' and 'chrY' (sample is female)
+  mean_coverage <- coverage %>%
+    filter(chrom != 'chrM') %>%
+    filter(chrom != 'chrY') %>%
+    group_by(chrom) %>%
+    summarize(mean_cov = mean(mean_coverage))
+  
+  # Calculate overall mean coverage excluding 'chrM' and 'chrY' (sample is female)
+  overall_mean <- mean(mean_coverage$mean_cov)
+  
+  all_mean_coverages[[new_name]] <- overall_mean
+  
+  # Plotting
+  chr_order <- c("chr1", "chr2", "chr3", "chr4", "chr5", "chr6", "chr7", "chr8", "chr9", "chr10",
+                    "chr11", "chr12", "chr13", "chr14", "chr15", "chr16", "chr17", "chr18", "chr19", "chr20",
+                    "chr21", "chr22", "chrX")
+  
+  barplot <- ggplot(mean_coverage, aes(x = factor(chrom, levels = chr_order), y = mean_cov)) +
+    geom_bar(stat = "identity", fill = "skyblue", width = 0.7) +
+    geom_hline(yintercept = overall_mean, color = "red", linetype = "dashed", size = 1) +
+    labs(title = paste(new_name, "Overall Mean Coverage:", round(overall_mean, 2)),
+         x = "Chromosome",
+         y = "Mean Coverage") +
+    theme_minimal() +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+    scale_y_continuous(limits = c(0, ifelse(sname == "S_17q1q_MYCN_DOX_D19_t_wes", 400, 150)))
+  barplots[[new_name]] <- barplot
+}
+
+# means across samples
+mean_coverages <- data.frame(
+  sample_id = names(all_mean_coverages),
+  mean_coverage = unlist(all_mean_coverages)
+)
+# Plotting
+sample_order <- new_names
+
+ggplot(mean_coverages, aes(x = factor(sample_id, levels = sample_order), y = mean_coverage)) +
+  geom_bar(stat = "identity", fill = "skyblue", width = 0.7) +
+  labs(title = "Overall Mean Coverage across Samples",
+       x = "Sample",
+       y = "Mean Coverage") +
+  theme_minimal() +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+  scale_y_continuous(limits = c(0, NA))
+
+```
+
+```{r plot, echo=F}
+reordered_barplots <- barplots[sample_order]
+for(barplot in reordered_barplots){
+  plot(barplot)
+}
+```
+
+```{r output csv, eval = F}
+write.table(mean_coverages, file=paste0(out_path, "mean_coverages_all_samples.tsv"), quote=FALSE, sep='\t', col.names = TRUE, row.names = FALSE)
+```

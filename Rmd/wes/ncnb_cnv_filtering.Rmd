@@ -1,0 +1,113 @@
+---
+title: "ncnb_cnv_filtering"
+author: "Peter Zoescher"
+date: "12/15/2023"
+output: html_document
+---
+
+```{r libraries, echo=F, warning=F}
+# to be run in ccribioinf/dockrstudio:4.0.3-v1
+# dockerhub manifest digest: sha256:055a81938337a3fc2a15039476094058f5691e02b529578041af508352264323
+
+suppressPackageStartupMessages(library(dplyr))
+suppressPackageStartupMessages(library(stringr))
+
+library(dplyr)
+library(stringr)
+```
+
+```{r settings}
+
+in_path <- "/path/to/r_input/"
+out_path <- "/path/to/r_output/"
+
+source("R/wes/wes_processing_v0.2.R")
+
+cnv_in <- read.table(paste0(in_path, "NB_cell_line_all_aberrations_coordinates_wgenes.csv"), header = TRUE, sep = ",")
+
+# CCRI-internal NB whitelist
+NB <- read.csv(file="metadata/ensids_NBwhitelist_dummy.tsv",
+                        header=TRUE, sep="\t")
+
+# Bailey et al 2018, genes carrying pan-tumor driver mutations that induce AA change.
+bailey2018 <- read.csv(file="metadata/ensids_bailey2018_220629.tsv",
+                        header=TRUE, sep="\t")
+
+```
+
+```{r annotate cnv}
+nb_wl_gr <- sort(makeGRangesFromDataFrame(NB,
+                                           keep.extra.columns=TRUE,
+                                           ignore.strand=FALSE,
+                                           seqinfo=NULL,
+                                           seqnames.field=c("SEQNAME"),
+                                           start.field="GENESEQSTART",
+                                           end.field=c("GENESEQEND"),
+                                           strand.field="strand",
+                                           starts.in.df.are.0based=FALSE))
+
+pan_wl_gr <- sort(makeGRangesFromDataFrame(bailey2018,
+                                           keep.extra.columns=TRUE,
+                                           ignore.strand=FALSE,
+                                           seqinfo=NULL,
+                                           seqnames.field=c("SEQNAME"),
+                                           start.field="GENESEQSTART",
+                                           end.field=c("GENESEQEND"),
+                                           strand.field="strand",
+                                           starts.in.df.are.0based=FALSE))
+
+
+cnv_in_gr <- makeGRangesFromDataFrame(cnv_in, 
+                                      keep.extra.columns=TRUE,
+                                      ignore.strand=TRUE,
+                                      seqnames.field="chromosome",
+                                      start.field="start.pos",
+                                      end.field="end.pos",
+                                      starts.in.df.are.0based=FALSE)
+
+cnv_in_gr <- addWlColumnToGr(cnv_in_gr, nb_wl_gr, "NB_WL")
+cnv_in_gr <- addWlColumnToGr(cnv_in_gr, pan_wl_gr, "PAN_WL")
+
+```
+
+```{r filter cnv}
+genenames <- unique(c(NB$GENENAME, bailey2018$GENENAME))
+
+reduce_genenames <- function(genenames, df) {
+  # Split the names in df2$genes.in.segment by semicolon
+  df$names_split <- strsplit(df$genes.in.segment, ";")
+
+  # Iterate through rows in df
+  for (i in 1:nrow(df)) {
+    # Keep only the names that match with genenames
+    df$names_split[[i]] <- intersect(df$names_split[[i]], genenames)
+  }
+
+  # Combine the remaining names into a single string
+  df$cancer.relevant.genes <- sapply(df$names_split, function(x) paste(x, collapse = ";"))
+  
+  df <- dplyr::select(df, seqnames, start, end, sample, NB_WL, PAN_WL, any_WL, cancer.relevant.genes)
+
+  return(df)
+}
+
+cnv_hits <- as.data.frame(cnv_in_gr) %>%
+  # information about presence in any whitelist
+  dplyr::mutate(any_WL=ifelse(rowSums(select(., NB_WL, PAN_WL) >= 1) > 0, 1, 0)) %>%
+  dplyr::filter(any_WL == 1 & N.BAF >= 100) %>%
+  reduce_genenames(genenames, .)
+
+cnv_out <- cnv_in %>%
+  dplyr::filter(N.BAF >= 100) %>%
+  dplyr::left_join(cnv_hits, by = c("chromosome" = "seqnames", "start.pos" = "start", "end.pos" = "end", "sample" = "sample")) %>%
+  # left_join introduces NAs to _WL fields where there used to be 0s
+  dplyr::mutate_at(vars(ends_with("_WL")), ~ifelse(is.na(.), 0, .)) %>%
+  # remove genes.in.segment, sd.BAF, sd.ratio and LPP
+  dplyr::select(-c(genes.in.segment, sd.BAF, sd.ratio, LPP))
+
+
+```
+
+```{r output csv, eval = F}
+write.table(cnv_out, file=paste0(out_path, "NB_cell_line_all_aberrations_coordinates_whitelistgenes_nbaf100.csv"), quote=FALSE, sep=',', col.names = TRUE, row.names = FALSE)
+```

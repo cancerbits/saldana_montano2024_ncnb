@@ -1,0 +1,5 @@
+id,name,read,pattern,sequence,feature_type
+BC1,WT_D19_R3,R2,5P(BC),GGAGAAGA,Multiplexing Capture
+BC6,17q_D19_R3,R2,5P(BC),TCACAGCA,Multiplexing Capture
+BC19,17qx_D19_R3,R2,5P(BC),CTAGCTGA,Multiplexing Capture
+BC96,17qMYCN_D19_R3,R2,5P(BC),TTCCTTCC,Multiplexing Capture

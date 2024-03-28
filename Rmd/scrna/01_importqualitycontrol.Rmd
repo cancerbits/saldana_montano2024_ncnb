@@ -1,0 +1,1033 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: Import and quality control and initial integration of all ncnb datasets "
+author: '`r Sys.info()["user"]`'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+params:
+  datapath: '~/mnt_out/input_data/'
+  plotpath: '~/mnt_out/scrna/plots/'
+  cachedir: '/path/to/cachedir/'
+  
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Import of datasets and quality control, as well as infercnv of the samples. 
+
+## Part I
+In this script we import each 10X dataset G1-G27, and to each of them we do the following: 
+
+a) Apply basic quality control, as well as emptydrops and scDblFinder
+b) Find clusters and markers and visualise
+c) Adjust quality control covariates to try to get rid of clusters with no markers and repeat. 
+
+All the final filters are stored in the metadata, until their subsequent  application.
+
+## Part II. 
+
+In this script we visualise the quality contol covariates of the processed Parse datasets, to which Quality control has already been applied during the default pipeline. 
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R  Part II depends specificaly on script scrna/04_WT_projecting_of_other_stages_and_genotypes.Rmd
+
+## Outputs
+
+The output of this script is a list of post-qc seurat objects that will be used for integration and other purposes, stored in variable solist2, and inside the RData object "ncnb2-filteredcovariates-seuratobjects_with_markers_vfeatures_vfeatures"  where vfeatures is the number of variable features used. 
+
+# 1. Load utilities and requirements.
+
+```{r}
+
+source("~/R/scutils.R")
+
+# import data structure with important file paths
+
+# created fulldatapaths list with all the paths to be needed inside R/importdata.R.
+
+source("~/R/importdata.R")
+
+cat("Global script parameters:\n")
+
+minfeatures=100
+mincells=100
+selecttop=5
+minfc=0.5
+mincpm=3
+pcdims=30
+vfeatures=2000
+#declare the doublet rate for scDblFinder
+dbr=0.01
+#emptyDrops: FDR cutoff
+fdr=0.05
+
+```
+
+## 2. Show the parameters
+
+```{r}
+print(params)
+```
+
+# 3. Import data matrices, convert to seurat objects, incorporate HTO data, and merge everything together
+
+```{r}
+
+fullrecreate=F; fullreload=T
+selectednames=names(allcountpaths)[c(1, 3:27)]
+
+
+solist=lapply(selectednames, function(nm){
+  cat("Dataset ", nm, ":", "\nFetching and adapting metadata...\n")
+ 
+  simpleCache(paste_("raw_seurat_", nm), {
+  cat("Importing count matrices and HTO assay matrices into Seurat object...\n")
+so=CreateSeuratObject(Read10X_h5(allcountpaths[[nm]], use.names = TRUE, unique.features = TRUE)$`Gene Expression`, project=nm, min.cells=mincells, min.features=minfeatures)
+print(so)
+
+dmassay=  CreateAssayObject(data= Read10X_h5(allcountpaths[[nm]], use.names = TRUE, unique.features = TRUE)$`Multiplexing Capture`[, so %>% metadata %>% rownames]) 
+so[["demux"]]=dmassay
+
+cat("Labeling cell barcodes with dataset name...\n")
+so=RenameCells(so, new.names= lapply(so %>% colnames, function(x) strsplit(x, split="-")[[1]][1]) %>% unlist )
+so=RenameCells(so, add.cell.id=nm)
+
+so
+
+}, assignToVar="so", recreate=fullrecreate)
+  
+}) %>% givename(., selectednames)
+
+
+get.sample.from.bc= Vectorize(function(dataset, bcid){
+  (bcrels %>% filter( multiseq_id == bcid, experiment_group == dataset))$sample_name
+}, USE.NAMES=F)
+  
+
+
+## Adding basic metadata 
+solist=lapply(selectednames, function(nm){
+  cat("Dataset ", nm, ":", "\nFetching and adapting demux metadata...\n")
+ so=solist[[nm]]
+ percent.mt<- PercentageFeatureSet(so, pattern = "^MT-") %>% givecolnames(., nms="percent.mt")
+ 
+ 
+  simpleCache(paste0("cellmetadata_basic_dataset", nm), {
+    
+  #assuming that all the relevant relationships
+  md=fread(demuxdatapaths[[nm]]) %>% as.data.frame %>% mutate( dsname=nm,  dsbarcode1=addprefix(Barcode, prefix=paste0(dsname,"_")), dsbarcode=trimone(dsbarcode1), experiment_group=dsname, multiseq_id=Assignment ) %>% col2names(., "dsbarcode")  %>% left_join(., bcrels, by=c("multiseq_id", "experiment_group")) %>% col2names(., "dsbarcode") 
+
+md2=cbind(md , md %>% pull(sample_name) %>% extractname %>% t %>% as.data.frame %>% giverownames(., nms=rownames(md)) ) %>% mutate(replicate=getrep(dsname), stage= stagename(dsname)) 
+
+
+cat("Incorporating dataset metadata...\n")
+fcat(md2 %>% pull(condition) %>% unique)
+relevantcells=rownames(md2)
+#removing cells that were prefiltered and thus not even subject to demux
+
+md2= cbind(md2,  percent.mt)
+
+md2}, assignToVar="md2", reload=fullreload, recreate=fullrecreate) 
+so= so[, rownames(md2)]  
+so= AddMetaData(so, metadata=md2)
+
+so
+}) %>% givename(., selectednames)
+
+```
+
+# 4. Preparing datasets for quality control
+
+We do some basic processing and find some markers to help us find spurious cells with no biological information, and thus guide the quality control.
+
+```{r}
+fullrecreate=F; fullreload=T
+
+solist=lapply(selectednames, function(nm){
+  simpleCache(paste0("preqc-processed-list-nomarkers-dataset-", nm, "-vfeatures-", vfeatures),{
+so=SCTransform(solist[[nm]], variable.features.n=vfeatures)
+so=RunPCA(so)
+so=FindNeighbors(so)
+so=FindClusters(so)
+so=RunUMAP(so, dims=1:pcdims)
+
+so},assignToVar="so", recreate=fullrecreate, reload=fullreload)
+so
+  })
+names(solist)= selectednames
+
+```
+
+## Find markers for each dataset or load datasets with markers calculated
+
+```{r}
+
+fullrecreate=F; fullreload=T
+
+
+solist=lapply( selectednames, function(nm){
+  simpleCache(paste0("ncnb2-dataset-", nm, "with-markers"), {
+
+    
+    cat(paste0("finding markers using the Riffle permutation test...\n"))
+      simpleCache(paste0("preqcmarkers for dataset", nm),{
+  m=cb_pos_markers(counts=solist[[nm]]@assays$RNA@counts, grouping=solist[[nm]] %>% metadata %>% pull("seurat_clusters") )
+
+
+}, assignToVar="m",  recreate=fullrecreate, reload=fullreload)
+    
+ cat("markers for dataset ", nm, ":\nNumber of unfiltered markers: ", nrow(m), "\n")
+ 
+ ##get names of clusters
+  
+ clusters=m %>% pull(group) %>% unique %>% as.numeric %>% sort
+ 
+  ## arrange and filter best markers
+    
+  if(is.null(selecttop)){
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC))
+  topstr=""  
+}else{
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC) %>% head(n=selecttop))
+}
+    mp=lt %>% Reduce(rbind,.)
+
+cat("Number of filtered markers: ", nrow(mp), "(", (nrow(mp)/nrow(m))*100, "% markers post filtering)\n")
+solist[[nm]]$RNA@misc$markers <- m
+solist[[nm]]$RNA@misc$top_markers <- mp
+cat("Dataset", nm, ": calculating residuals for missing genes in scale data...\n")
+solist[[nm]] <- GetResidual(solist[[nm]], features = solist[[nm]]$RNA@misc$top_markers$feature, verbose = F)
+
+
+solist[[nm]]
+}, assignToVar="so",  recreate=fullrecreate, reload=fullreload)
+
+so}) %>% givename(., selectednames)
+
+
+```
+
+# Setting cutoffs for quality control and testing on one dataset
+
+The main list here helps filter each dataset on each covariate.
+
+```{r, fig.height=3, fig.height=20}
+
+testqc=F # make positive to execute the full qc workflow on one sample. 
+
+setglobalfilter=function(variable.name=NULL,value=NA){
+ lapply(qcpars %>% names, function(nm){
+   qcfilters[[nm]][[variable.name]]<<-value
+ })
+  
+}
+clearfilters=function(){
+ lapply(qcpars %>% names, function(nm){
+   qcfilters[[nm]]<<-list(depth=NA, genes=NA, mito=NA)
+ })
+  
+}
+
+
+
+qcpars=list(
+  G1 = list(counts = round(10**3.5), features = 0, mito = 10),
+  G2 = list(counts = 3000, features = 0, mito = 10),
+  G3 = list(counts = round(10**4), features = 0, mito = 7.5),
+  G4 = list(counts = 10000, features =  0, mito = 8), #modiied mito 20230829
+  G5 = list(counts = round(10**3.5), features =  0, mito = 10),
+  G6 = list(counts = round(10**4), features =  0, mito = 8), #modified  mito 20230829
+  G7 = list(counts = round(10**4.1), features =  0, mito = 8), #modified counts and mito 20230829
+  G8 = list(counts = round(10**3.9), features =  0, mito = 10),
+  G9 = list(counts = round(10**3.85), features =  0, mito = 10),
+  G10 = list(counts = round(10**3.6), features = 0, mito = 7.5),
+  G11 = list(counts = round(10**3.6), features = 0, mito = 10),
+  G12 = list(counts = round(10**3.7), features = 0, mito = 10),
+  G13 = list(counts = round(10**4), features = 0, mito = 10),
+  G14 = list(counts = 5500, features = 1000, mito = 13), 
+  G21 = list(counts = 6000, features = 1000, mito = 8), # modified counts 20230829
+  G15 = list(counts = 3500, features = 1000, mito = 5),#looking very good
+  G22 = list(counts = 5000, features = 1000, mito = 6),
+  G16 = list(counts = 3000, features = 1200, mito = 8), #modified counts 20230829
+  G23 = list(counts = 3000, features = 1000, mito = 6),# decreased mito 20230829
+  G17 = list(counts = 2000, features = 1000, mito = 8),
+  G24 = list(counts = 1500, features = 1000, mito = 6), 
+  G18 = list(counts = 3500, features = 1000, mito = 10), #LQ. #moved counts on 20230829
+  G25 = list(counts = 3500, features = 1000, mito = 5), #reasonably ok.
+  G19 = list(counts = 1800, features = 1000, mito = 6), # mito could be improved, good
+  G26 = list(counts = 2000, features = 1000, mito = 10), #great overall, no mito
+  G20 = list(counts = 3000, features = 1000, mito = 15),#  relatively ok
+  G27 = list(counts = 3000, features = 1000, mito = 15)# looks pretty alright
+  )
+
+
+
+dbcutoffs=list(
+G1= .01,
+G2= .005,
+G3= .016,
+G4= .005,
+G5= .005,
+G6= .003,
+G7= .005,
+G8= .005,
+G9= .005,
+G10= .005,
+G11= .005,
+G12=.005,
+G13=.005,
+G14= .005,
+G21= .007,
+G15= .005,
+G22= .007,
+G16= .0075,
+G23= .0125,
+G17=.0020,
+G24=.003,
+G18=.007,
+G25=.007,
+G19=.00375,
+G26=.005,
+G20=0.01,
+G27=0.007
+)
+
+
+
+########################################################################################
+#all filter parameters in one table
+########################################################################################
+datte=timestamp("") %>% chopstring #current filtering table date "2023-07-24"
+simpleCache(paste0("filteringparams_", datte), {
+allfilterpars=lapply(qcpars, function(x){as.data.frame(x)}) %>% Reduce(rbind, .) %>% giverownames(., names(qcpars)) %>% cbind(., dbcutoffs %>% as.data.frame %>%t %>% givecolnames(., ind=1, nms="scDblFinder.scdblscore.cutoff") %>% as.data.frame %>% mutate(scDblFinder.doublet.rate=dbr, emptyDrops.fdr.cutoff=fdr))
+
+fwrite(allfilterpars, file=paste0("~/ncnb2_noncode/metadata/filtering_params_all_datasets_", datte, ".csv"))
+allfilterpars}, recreate=T)
+
+
+solist=lapply(selectednames, function(nm){  
+fcat("Dataset", nm)
+so= AddMetaData(solist[[nm]], solist[[nm]] %>% metadata %>% mutate( counts.cutoff=qcpars[[nm]]$counts, features.cutoff= qcpars[[nm]]$features, mito.cutoff=qcpars[[nm]]$mito, qcc.pass=(((nFeature_RNA>=features.cutoff & nCount_RNA >= counts.cutoff) & percent.mt<= mito.cutoff )),scDblFinder.doubletrate=dbr, dbcutoff=getdbcutoff(dsname) ))
+
+so  
+  
+  }) %>% givename(., selectednames)
+
+#checking whether the filter has been implemented
+pmeta=lapply(selectednames, function(nm){
+  
+  solist[[nm]] %>% metadata %>% mutate(stage=stagename(dsname)) %>% group_by(stage, dsname) %>% summarise(counts.cutoff.current=mean(counts.cutoff), counts.cutoff.expected=qcpars[[nm]]$counts,features.cutoff.current=mean(features.cutoff), features.cutoff.expected=qcpars[[nm]]$features,mito.cutoff.current=mean(mito.cutoff), mito.cutoff.expected=qcpars[[nm]]$mito, discrepancies.found=sum((counts.cutoff.current-counts.cutoff.expected)!=0, (features.cutoff.current-features.cutoff.expected)!=0, (mito.cutoff.current-mito.cutoff.expected)!=0  )) %>% select(stage, dsname, discrepancies.found)
+  
+}) %>% Reduce(rbind, .)
+
+
+if(testqc){
+# process one individual dataset.
+#choose the dataset name
+nm= "G16"
+demuxvar="sample_name"
+pjname=Project(solist[[nm]])
+
+qcplots(solist[[nm]], plotname=paste_("qcplots", stagename(nm), pjname, "prefilter_preview"), plotred="umap", demux=demuxvar, plotsize=20, path=params$plotpath, ww=1.5, hh=2.2, cutoffs=qcpars[[nm]], cellnumbers=T)
+
+#
+qcplots(filterds(solist[[nm]]), plotname=paste_("qcplots", stagename(nm), pjname, "filter_preapplied"), plotred="umap", demux=demuxvar, plotsize=20, path=params$plotpath, ww=1.5, hh=2.2, cutoffs=qcpars[[nm]], cellnumbers=T, seriate.method=NULL)
+
+verbose=F
+simpleCache(paste_("seurat_qccfiltered_processed_with_markers_dataset", nm, "counts", qcpars[[nm]]$counts, "features",qcpars[[nm]]$features, "mito", qcpars[[nm]]$mito, "dbr", dbcutoffs[[nm]] ), { 
+cat(paste0("reprocessing filtered Dataset ", nm, "...\n"))
+so=filterds(solist[[nm]])    
+so=SCTransform(so, verbose=verbose)
+so=RunPCA(so, verbose=verbose)
+so=FindNeighbors(so, verbose=verbose)
+so=FindClusters(so, verbose=verbose)
+so=RunUMAP(so, dims=1:pcdims, verbose=verbose)
+cat(paste0("finding markers using the Riffle permutation test...\n"))  
+
+m=cb_pos_markers(counts=so@assays$RNA@counts, grouping=so %>% metadata %>% pull("seurat_clusters") )
+
+   clusters=m %>% pull(group) %>% unique %>% as.numeric %>% sort
+ ## arrange and filter best markers
+    
+  if(is.null(selecttop)){
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC))
+  topstr=""  
+}else{
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC) %>% head(n=selecttop))
+}
+    mp=lt %>% Reduce(rbind,.)
+
+cat("Number of filtered markers: ", nrow(mp), "(", (nrow(mp)/nrow(m))*100, "% markers post filtering)\n")
+so$RNA@misc$markers <- m
+so$RNA@misc$top_markers <- mp
+cat("Dataset", nm, ": calculating residuals for missing genes in scale data...\n")
+so <- GetResidual(so, features = so$RNA@misc$top_markers$feature, verbose = F)
+so
+}, assignToVar="so",noload=F, recreate=T)
+
+solist2[[nm]]=so
+
+qcplots(so, plotname=paste_("qcplots", stagename(nm), pjname, "postqccfilter"), plotred="umap", demux=demuxvar, plotsize=20, path=params$plotpath, ww=1.5, hh=2.2,plot.title=paste_(stagename(nm), nm), cutoffs=qcpars[[nm]], cellnumbers=T, seriate.method="signature")
+}
+
+```
+
+# Generate all QC covariate plots
+
+```{r, fig.height=3, fig.height=20}
+## draw quality control plots
+allqc=lapply(selectednames, function(nm){
+showdataset(solist[[nm]]) 
+pjname=Project(solist[[nm]])
+
+
+qcplots(solist[[nm]], plotname=paste_("qcplots", stagename(nm), pjname, "filter0_preview"), plotred="umap", demux=demuxvar, plotsize=20, , plot.title=paste(stagename(nm), nm), path=params$plotpath, ww=1.5, hh=2.2, cutoffs=qcpars[[nm]], cellnumbers=T)
+## first draw filter preapplied, so the output plot is just the filter preview
+qcplots(filterds(solist[[nm]]), plotname=paste_("qcplots", stagename(nm), pjname, "filter1_preapplied"), plotred="umap", plot.title=paste(stagename(nm), nm), demux=demuxvar, plotsize=20, path=params$plotpath, ww=1.5, hh=2.2, cutoffs=qcpars[[nm]], cellnumbers=T, seriate.method=NULL)
+
+}) 
+names(allqc)= selectednames
+
+# store a table with cell counts before and after presumed filters
+simpleCache(timestamp("preqc_counts"), {
+fcat("Estimating cells that would pass the filter (before filtering)...")
+preqc.counts<-lapply(solist %>% names, function(nm){
+
+  solist[[nm]] %>%   metadata %>% mutate(stage=stagename(dsname)) %>% group_by(dsname, !!sym(demuxvar), stage, condition) %>%
+    summarise(prefilter.counts=n(), total.qcc.pass=sum(qcc.pass), percent.qcc.pass= total.qcc.pass/prefilter.counts)
+  }
+       ) %>% Reduce(rbind,.) %>% as.data.frame
+
+preqc.global<-preqc.counts %>% group_by(stage, dsname) %>% summarise(prefilter.counts=sum(prefilter.counts, na.rm=F), total.qcc.pass=sum(total.qcc.pass)) %>% as.data.frame %>% arrange(factor(stage, levels=c("D3","D6","D12", "D15","D14","D19", "D28")))
+
+
+fwrite(preqc.counts, file="preqc_counts.csv" )
+preqc.counts}, assignToVar="preqccounts", recreate=T )
+
+
+```
+
+# Explore doublet parameters
+
+```{r}
+dbrscan=T
+if(dbrscan==T){
+dbrs= seq(0.01, 0.2, 0.06)
+nm="G14"
+scores=lapply(dbrs, function(dbr){
+  fcat(dbr)
+      scDblFinder(as.SingleCellExperiment(solist[[nm]]), dbr=dbr, samples="orig.ident")$scDblFinder.score
+  
+  
+  }) 
+fnames=addprefix(dbrs, "dbr")
+names(scores)= fnames
+
+#tidify with metadata
+tid=solist[[nm]] %>% metadata %>% cbind(., as.data.frame(scores)) %>% pivot_longer(.,c("dbr0.01", "dbr0.07", "dbr0.13", "dbr0.19"), names_to= "dbr", values_to="score")
+
+ggplot(tid, aes(fill=hto_classif, x=factor(dbr, levels=fnames), y=score))+geom_boxplot()+coord_cartesian(ylim=c(0, 0.01))
+
+
+
+}
+```
+
+# Quantify and detect empty droplets
+
+Quoting bioconductor:
+
+Droplets with significant deviations from the ambient profile are detected at a specified FDR threshold, e.g., with `FDR` below 1%. These can be considered to be cell-containing droplets, with a frequency of false positives (i.e., empty droplets) at the specified FDR. Furthermore, droplets with very large counts are automatically retained by setting their *p*-values to zero. This avoids discarding droplets containing cells that are very similar to the ambient profile.
+
+Cells with UMI counts less than or equal to parameter "lower" (defaults to 100) will output a FDR=NA as these will be automatically consider empty droplets and will be used to estimate ambient RNA.
+
+```{r}
+nms=names(solist)
+########################################################################################
+# calculate empty droplets
+########################################################################################
+
+library(DropletUtils)
+
+alldroplets=lapply(selectednames, function(nm){
+
+ fcat("dataset", nm) 
+
+simpleCache(paste0("emptydrops_", getpname(solist[[nm]])), {
+  sce = as.SingleCellExperiment(CreateSeuratObject(Read10X_h5(allcountpaths[[nm]])$`Gene Expression`))
+
+#sce=as.SingleCellExperiment(so)
+e=emptyDrops(counts(sce) )
+prp=paste0(nm, "_")
+predashlength=strsplit(rownames(e)[1], split="-")[[1]][1] %>% nchar 
+nrn=e %>% as.data.frame %>% rownames %>% substr(., 1, predashlength) %>% paste0(prp, .)
+rownames(e)=nrn
+  
+e
+}, recreate=T, assignToVar="e")
+
+e
+}
+
+) %>% givename(., selectednames)
+
+
+########################################################################################
+# format the emtpydroplets output into metadata info tables
+########################################################################################
+simpleCache("edropletsdata_formatted", {#}, assignToVar="alldroplets.ready", reload=T)
+
+alldroplets.ready=lapply(nms, function(nm){
+showdataset(solist[[nm]])
+cells=solist[[nm]]@meta.data %>% rownames   
+solist[[nm]]@meta.data[, "isemptydroplet"]= alldroplets[[nm]][cells,]$FDR>fdr
+solist[[nm]] %>% metadata %>% mutate(emptydrops.fdr=fdr) %>% select(isemptydroplet, emptydrops.fdr)
+}) %>% givename(., nms)
+
+}, assignToVar="alldroplets.ready", recreate=F, reload=T)
+```
+
+# Quantify cell cycle scoring
+
+```{r}
+
+########################################################################################
+#estimate cell cycle scores
+########################################################################################
+fullrecreate=F; fullreload=T
+s.genes <- cc.genes$s.genes
+g2m.genes <- cc.genes$g2m.genes
+
+simpleCache("cellcycle_information_all_datasets", { #}, assignToVar="cc.information", reload=T)
+cc.information= lapply(selectednames, function(nm){
+
+  simpleCache(paste0("cellcycle_quantification_", nm), {  
+ solist[[nm]] <- CellCycleScoring(solist[[nm]], s.features = s.genes, g2m.features = g2m.genes, set.ident = TRUE)
+solist[[nm]]@meta.data[, "ccvar"]=  solist[[nm]]@meta.data[, "S.Score"]-solist[[nm]]@meta.data[, "G2M.Score"]
+
+solist[[nm]] %>% metadata %>% select(ccvar, Phase, S.Score, G2M.Score)
+  }, assignToVar="ccscores", reload=T)
+  ccscores
+
+}) %>% givename(., selectednames)
+cc.information
+}, assignToVar="cc.information", recreate=fullrecreate, reload=fullreload)
+
+```
+
+## Calculating Doublet scores
+
+Make the appropriate changes to the filters in the filter block and update the section below.
+
+```{r, fig.width=8,height=12 }
+
+########################################################################################
+#calculate the doublet scores
+########################################################################################
+simpleCache(paste0("scdblscores_all_dbr", dbr), {
+alldbscores=lapply(selectednames, function(nm){
+
+  simpleCache(paste0("scdblscores", nm, "dbr_", dbr), {
+   library(scDblFinder) 
+    #solist[[nm]]@meta.data[, "hto_classif"]=solist[[nm]]@meta.data$hto_demux %>% classifydemux
+    solist[[nm]]@meta.data= solist[[nm]] %>% metadata %>% mutate(is.doublet=!!sym(demuxvar)=="Doublet")
+    
+    #parameter knownDoublets="is.doublet" (logical stating whether cell is doublet)
+    scorre=scDblFinder(as.SingleCellExperiment(solist[[nm]]), dbr=dbr, samples="orig.ident")$scDblFinder.score
+    #solist[[nm]]@meta.data[, "scdblscore"]=scorre
+
+    solist[[nm]] %>% metadata %>% mutate(dbrate=dbr, scdblscore=scorre, scDblFinder.dbrate=dbr) %>% select(is.doublet,scDblFinder.dbrate,  scdblscore)
+  }, assignToVar="s", reload=T)
+  s
+}
+
+) %>% givename(., selectednames)
+
+alldbscores},assignToVar="alldbscores", reload=T)
+
+########################################################################################
+#incorporate doublet metadata  into metadata.
+########################################################################################
+solist= lapply(selectednames, function(nm){
+  solist[[nm]]@meta.data[, "demux_classif"]=solist[[nm]]@meta.data[[demuxvar]] %>% classifydemux
+  solist[[nm]] =AddMetaData(solist[[nm]], alldbscores[[nm]] )
+
+  solist[[nm]] = AddMetaData(solist[[nm]], solist[[nm]] %>% metadata %>% mutate(stage=stagename(dsname),
+                        dayds=paste_(stage, dsname),
+                        dbcutoff=getdbcutoff(dsname)))
+}) %>% givename(., selectednames)
+
+########################################################################################
+#compile all metadata and qc cutoffs for all datasets. 
+########################################################################################
+
+dbmetadata =solist %>% lapply(., function(x) x %>% metadata %>% mutate(stage=stagename(dsname), replicate=getrep(dsname)) %>% select(-matches("_cnts"))  %>% select(-matches("CMO")) %>% select(-matches("^BC"))   ) %>% Reduce(rbind, .) 
+########################################################################################
+# plot the scdblscore per dataset
+########################################################################################
+ggplot(dbmetadata , aes(fill=demux_classif, x=demux_classif, y=scdblscore))+geom_boxplot()+coord_cartesian(ylim=c(0, .02))+geom_hline(aes(yintercept=dbcutoff),color="red" )+facet_wrap(~dayds)+rotatex(90)+ggtitle("scdblscore distributions and cutoffs among demux types, by day_dataset")
+
+
+```
+
+## Incorporate all metadata into the main object, including quality control pass information.
+
+```{r}
+########################################################################################
+#incorporate all metadata and all quality control cutoffs and calculations already into metadata. qcglobal indicates whether a cell passed all quality controls
+########################################################################################
+#load relevant caches from above
+fullrecreate=F; fullreload=T
+simpleCache(paste0("scdblscores_all_dbr", dbr),assignToVar="alldbscores", reload=T)
+simpleCache("cellcycle_information_all_datasets", assignToVar="cc.information", reload=T)
+simpleCache("edropletsdata_formatted", assignToVar="alldroplets.ready", reload=T)
+simpleCache("demultiplex2_all_processed", assignToVar="newdemux.full.processed", reload=T, recreate=F)
+
+
+
+solist= lapply(selectednames, function(nm){
+  fcat("Loading metadata for Dataset", nm)
+  #reload basic metadata just in case anything was not loaded yet
+  simpleCache(paste0("cellmetadata_basic_dataset", nm), assignToVar="md2", reload=fullreload, recreate=fullrecreate) 
+  solist[[nm]] =AddMetaData(solist[[nm]], md2)
+  #incorporate cutoffs
+  solist[[nm]]= AddMetaData(solist[[nm]], solist[[nm]] %>% metadata %>% mutate( counts.cutoff=qcpars[[nm]]$counts, features.cutoff= qcpars[[nm]]$features, mito.cutoff=qcpars[[nm]]$mito, qcc.pass=((nFeature_RNA>=features.cutoff & nCount_RNA >= counts.cutoff & percent.mt<= mito.cutoff )),scDblFinder.doubletrate=dbr, dbcutoff=getdbcutoff(dsname) ))
+  
+  
+  #incorporate droplets, cc, cutoffs
+  
+  
+  
+  solist[[nm]] =AddMetaData(solist[[nm]], alldroplets.ready[[nm]] )
+  solist[[nm]] =AddMetaData(solist[[nm]], cc.information[[nm]] )
+  solist[[nm]] =AddMetaData(solist[[nm]], alldbscores[[nm]] )
+  
+  #incorporate variable that has the conditions, or failed demux category when present
+  solist[[nm]]@meta.data[, "condition_cellranger"]=solist[[nm]]@meta.data[, "condition"]
+  solist[[nm]]@meta.data[, "demux_classif_cellranger"]=solist[[nm]]@meta.data[["sample_name"]] %>% classifydemux
+  
+  
+  solist[[nm]] = AddMetaData(solist[[nm]], solist[[nm]] %>% metadata %>% mutate(stage=stagename(dsname),
+                        dayds=paste_(stage, dsname),
+                        conditiondemux=get_condition_demux(condition_cellranger, demux_classif_cellranger),
+                        dbcutoff=getdbcutoff(dsname),
+                        edqc.pass= (scdblscore<= dbcutoff & !isemptydroplet),
+                        qcpass.global= edqc.pass & qcc.pass))
+
+  ################################################################################
+#incorporate alternative demux info from demultiplex2
+################################################################################
+ solist[[nm]] = AddMetaData(solist[[nm]], newdemux.full.processed[[nm]]) # a subset of cells with NAs on them are not present in the demux table
+    
+    
+}) %>% givename(., selectednames)
+
+
+simpleCache("allpreqc-metadata", {
+allmetadata =solist %>% lapply(., function(x) x %>% metadata %>% mutate(stage=stagename(dsname), replicate=getrep(dsname)) %>% select(-matches("_cnts"))  %>% select(-matches("CMO")) %>% select(-matches("^BC"))   ) %>% Reduce(rbind, .) 
+}, assignToVar="allmetadata", reload=F, recreate=T)
+```
+
+
+## Summary of all the filterings and their impact on cell number
+
+```{r}
+demux.classif.var="conditiondemux2"
+sumdfall=allmetadata  %>% group_by(dayds) %>% summarise(counts=n())
+
+levs=sumdfall[sumdfall %>% pull(dayds) %>% strsplit(., split="_") %>% lapply(., function(x) substr(x[1], 2,4)) %>% Reduce(c, .) %>% as.numeric %>% order, ]$dayds
+
+filteroutput= allmetadata %>% group_by(dayds, !!sym(demux.classif.var)) %>% summarise(qcpass.sum=sum(qcpass.global), qcpass.percentage=qcpass.sum/n()) 
+
+filteroutput.percentage=  filteroutput %>% select(dayds, !!sym(demux.classif.var), qcpass.percentage) %>% pivot_wider( names_from=c( demux.classif.var), values_from="qcpass.percentage") 
+
+filteroutput.sum=  filteroutput %>% select(dayds, !!sym(demux.classif.var), qcpass.sum) %>% pivot_wider( names_from=c( demux.classif.var), values_from="qcpass.sum") 
+
+fwrite(filteroutput.sum, file="~/ncnb2_noncode/metadata/ncnb2_preqc_postfiltercellnumbers.csv")
+
+fwrite(filteroutput.percentage, file="~/ncnb2_noncode/metadata/ncnb2_preqc_postfiltercellpercentages.csv")
+
+
+```
+
+Total number of cells of each kind after applying filters
+
+```{r}
+(filteroutput.sum %>% giverownames(., filteroutput.sum$dayds))[levs, ]
+```
+
+percentage of cells of each kind left after applying filters
+
+```{r}
+(filteroutput.percentage %>% giverownames(., filteroutput.sum$dayds))[levs, ]
+```
+
+# Make a plot of what percentage of each kind of cell was affected by quality control.
+
+```{r, fig.width=8, fig.height=10}
+## gather all the quality control evaluations in one big dataframe for plotting. 
+
+sca=4
+sz=4
+sumdf=allmetadata  %>% group_by(dayds, !!sym(demux.classif.var)) %>% summarise(counts=n())
+tpng("barplot_qccpass_distributions", path=params$plotpath, wi=w*sca, he=w*sca*1.2)
+ggplot(allmetadata, aes(x=!!sym(demux.classif.var)))+geom_bar(aes(fill=qcpass.global), position="fill")+
+  geom_text(data=sumdf, aes(y=0.5, label=counts), angle=90, size=sz)+
+  facet_wrap(~factor(dayds, levels=levs), scales="free_x")+
+  theme_classic()+
+  rotatex(90)
+dev.off()
+
+ggplot(allmetadata, aes(x=!!sym(demux.classif.var)))+geom_bar(aes(fill=qcpass.global), position="fill")+
+  geom_text(data=sumdf, aes(y=0.5, label=counts), angle=90, size=sz)+
+  facet_wrap(~factor(dayds, levels=levs), scales="free_x")+
+  theme_classic()+
+  rotatex(90)
+
+
+sca=1
+tpng("barplot_qccpass_distributions_by_day-ds", path=params$plotpath, wi=w*sca*1.5, he=w*sca)
+
+ggplot(allmetadata, aes(x=factor(dayds, levels=levs)))+geom_bar(aes(fill=qcpass.global), position="fill")+
+  geom_text(data=sumdfall, aes(y=0.5, label=counts), angle=90)+
+  theme_classic()+
+  rotatex(90)
+dev.off()
+```
+
+
+# Applying quality control filters (QC covariates, demultiplexing Negatives, Doublets)
+
+We apply the filters above and redo minimal reprocessing to make sure we are only keeping high quality cells.
+
+```{r}
+
+fullrecreate=F; fullreload=T
+verbose=F
+datte="2023-08-28"
+simpleCache(paste0("ncnb2-filteredcovariates-seuratobjects_with_markers_vfeatures_", vfeatures),{
+  
+
+
+solist2=lapply(selectednames, function(nm){
+
+cat(paste0("Dataset ", nm, "...\n"))
+
+simpleCache(paste_("seurat_qccfiltered_processed_with_markers_dataset", nm, "counts", qcpars[[nm]]$counts, "features",qcpars[[nm]]$features, "mito", qcpars[[nm]]$mito, "dbr", dbcutoffs[[nm]], "vfeatures", vfeatures, datte ), { 
+cat(paste0("reprocessing filtered Dataset ", nm, "...\n"))
+so=filterds(solist[[nm]], dbcutoff=getdbcutoff(nm), filter.empty.drops=T, demuxvar=demux.classif.var)    
+so=SCTransform(so, verbose=verbose, variable.features.n=vfeatures)
+so=RunPCA(so, verbose=verbose)
+so=FindNeighbors(so, verbose=verbose)
+so=FindClusters(so, verbose=verbose)
+so=RunUMAP(so, dims=1:30, verbose=verbose, return.model=T)
+cat(paste0("finding markers using the Riffle permutation test...\n"))  
+
+m=cb_pos_markers(counts=so@assays$RNA@counts, grouping=so %>% metadata %>% pull("seurat_clusters") )
+
+   clusters=m %>% pull(group) %>% unique %>% as.numeric %>% sort
+ ## arrange and filter best markers
+    
+  if(is.null(selecttop)){
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC))
+  topstr=""  
+}else{
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC) %>% head(n=selecttop))
+}
+    mp=lt %>% Reduce(rbind,.)
+
+cat("Number of filtered markers: ", nrow(mp), "(", (nrow(mp)/nrow(m))*100, "% markers post filtering)\n")
+so$RNA@misc$markers <- m
+so$RNA@misc$top_markers <- mp
+cat("Dataset", nm, ": calculating residuals for missing genes in scale data...\n")
+so <- GetResidual(so, features = so$RNA@misc$top_markers$feature, verbose = F)
+}, assignToVar="so", reload=T)
+so
+  }) %>% givename(., selectednames)
+solist2}, assignToVariable="solist2", recreate=fullrecreate, reload=fullreload)
+
+
+
+```
+
+InferCNV to find signatures of 17q and 1q
+
+```{r}
+library(infercnv)
+demuxvar.infercnv="conditiondemux"
+refcond="cWT"
+countscut=10000
+featurescut=1000
+mitocut=10
+temp.pars=qcpars
+cnvs=lapply(selectednames[22:length(selectednames)], function(nm){
+
+cnv.outpath=paste0(params$plotpath, "/", timestamp(paste0("infercnv_", demuxvar.infercnv, "_", countscut, "_counts")), "/", stagename(nm),"_", nm )
+
+  temp.pars[[nm]]$counts=countscut
+  temp.pars[[nm]]$features=featurescut
+  temp.pars[[nm]]$mito=mitocut
+  
+  so=filterds(solist[[nm]], qc.pars=temp.pars )
+cb_run_infercnv(so$RNA@counts, 
+                            conditions= so %>% metadata %>% pull(!!sym(demuxvar.infercnv)), cnv.outpath, ref_conditions = refcond,
+                            gene_order_file = NULL, num_threads = 1, keep_infercnv_scores = TRUE) 
+}) %>% givename(selectednames)
+```
+
+
+## Analysing infercnv results
+```{r}
+
+################################################################################
+# getting gene order table
+################################################################################
+    position_file <- file.path(params$datapath, 'gene_ordering_file_gencode_v19.txt')
+    if (!file.exists(position_file)) {
+      download.file(url = 'https://data.broadinstitute.org/Trinity/CTAT/cnv/gencode_v19_gene_pos.txt', 
+                    destfile = position_file)  
+    }      
+    
+    positions=fread(position_file)   %>% as.data.frame
+    
+nm="G15"
+cnv.outpath=paste0(params$plotpath, "/", timestamp(paste0("infercnv_", demuxvar.infercnv, "_", countscut, "_counts")), "/", stagename(nm),"_", nm )
+orderedcnv= readRDS(paste0(cnv.outpath, "/infercnv.observations.Rds"))    
+
+    
+   getchr= function(x) (positions %>% filter(V1==x))[1,"V2" ]
+    
+    fcat("preparing chromosome annotation...")
+    chrs=lapply(orderedcnv %>% colnames, getchr) %>% Reduce(c, .) 
+    colanno= chrs  %>% as.data.frame(., row.names=orderedcnv %>% colnames) 
+    colnames(colanno)="chromosome"
+    colanno= colanno %>% mutate(chromosome=factor(chromosome, levels= addprefix(1:22, prefix="chr"))) 
+    filterchrs=F
+    if(!filterchrs){
+      allchrs= unique(chrs)
+      
+    }else{
+      allchrs=c("chr2", "chr17")
+    }
+    colanno= colanno %>% filter(chromosome %in% allchrs)
+
+    
+         
+    chrpal=c("#515051", "#939393", "#D8D8D8")[rep(1:3, 8)[1:22]] %>% namenums(., prefix="chr") 
+    
+    cmap=c("#00008B", "#FFFFFF", "#8B0000") #infercnv colormap
+    br=seq(.85,1.15,.05)  ## numeric breaks of the color bins
+    colls=colorRampPalette(cmap, space="rgb")(length(br)) # actual colors  associated with each number bin
+    
+    msg("making heatmap...")
+
+    
+    
+    pha= ComplexHeatmap::pheatmap( orderedcnv , 
+                                   scale="col",
+                                   annotation_col=colanno, 
+                                   annotation_colors=list(chromosome=chrpal),
+                                   cluster_row=F, 
+                                   cluster_col=F,
+                                   show_colnames=F,
+                                   border_color=NA,
+                                   use_raster=T,
+                                   show_rownames=F, 
+                                   breaks=br,
+                                   color=colls,
+                                   annotation_legend = FALSE
+                                   
+                                   
+                                   
+    )
+    
+
+    sca=6#9;
+    rr=600;
+    #original height 2.2. making this shorter
+    fcat("dumping heatmap to figure...")
+    cnvplotname=paste_("pheatmapcol", demuxvar.infercnv, countscut, "counts", stagename(nm), nm)
+    tpng(cnvplotname, width=w*2.5*sca, height=w*1.2*sca, res=rr)
+    print(pha)
+    dev.off()
+
+
+
+```
+
+```{r}
+getchr= function(x) (positions %>% filter(V1==x))[1,"V2" ]
+    
+    fcat("preparing chromosome annotation...")
+    chrs=lapply(orderedcnv %>% colnames, getchr) %>% Reduce(c, .) 
+    colanno= chrs  %>% as.data.frame(., row.names=orderedcnv %>% colnames) 
+    colnames(colanno)="chromosome"
+    colanno= colanno %>% mutate(chromosome=factor(chromosome, levels= addprefix(1:22, prefix="chr"))) 
+    filterchrs=F
+    if(!filterchrs){
+      allchrs= unique(chrs)
+      
+    }else{
+      allchrs=c("chr2", "chr17")
+    }
+    colanno= colanno %>% filter(chromosome %in% allchrs)
+
+    
+      #chrpal=viridis(22, option="C") %>% sample(., 22, replace=F) %>% namenums(., prefix="chr")            
+    chrpal=c("#515051", "#939393", "#D8D8D8")[rep(1:3, 8)[1:22]] %>% namenums(., prefix="chr") 
+    
+    cmap=c("#00008B", "#FFFFFF", "#8B0000") #infercnv colormap
+    #cmap= c('#a1d76a','#f7f7f7','magenta') #green, magenta
+    br=seq(.85,1.15,.05)  ## numeric breaks of the color bins
+    colls=colorRampPalette(cmap, space="rgb")(length(br)) # actual colors  associated with each number bin
+    
+    cat("making heatmap...")
+    #tryCatch({  
+    
+    
+    pha= ComplexHeatmap::pheatmap( orderedcnv , 
+                                   scale="col",
+                                   annotation_col=colanno, 
+                                   annotation_colors=list(chromosome=chrpal),
+                                   cluster_row=F, 
+                                   cluster_col=F,
+                                   show_colnames=F,
+                                   border_color=NA,
+                                   use_raster=T,
+                                   show_rownames=F, 
+                                   breaks=br,
+                                   color=colls,
+                                   annotation_legend = FALSE
+                                   
+                                   
+                                   
+    )
+    
+    
+
+    sca=6;
+    rr=600;
+    fcat("dumping heatmap to figure...")
+    cnvplotname=paste_("pheatmapcol", demuxvar.infercnv, countscut, "counts", stagename(nm), nm)
+    tpng(cnvplotname, width=w*2.5*sca, height=w*1.2*sca, res=rr)
+    print(pha)
+    dev.off()
+    pha
+
+```
+
+
+
+# Plot results of the filtered counts
+
+```{r}
+
+selectednames2=c("G13", "G24")
+selection=selectednames
+allqc2=lapply(selection, function(nm){
+so=solist2[[nm]]
+showdataset(so) 
+pjname=Project(so)
+
+qcplots(so, plotname=paste_("qcplots", stagename(nm), pjname, "postqccfilter"),plot.title=paste0(stagename(nm), pjname), plotred="umap", demux=demux.classif.var, plotsize=20, path=params$plotpath, ww=1.5, hh=2.2, cutoffs=qcpars[[nm]], cellnumbers=T, seriate.method = NULL)
+}) %>% givename(selection)
+
+
+```
+
+Plot quality control measures for a single dataset. 
+
+```{r, fig.width=10, fig.height=15}
+nm="G25"
+qcplots(solist2[[nm]], plotname=paste_("qcplots", stagename(nm), pjname, "prefilter_preview"),plot.title=paste_(stagename(nm), Project(solist2[[nm]])), plotred="umap", demux="hto_demux", plotsize=20, path=params$plotpath, ww=1.5, hh=2.2, cutoffs=qcpars[[nm]], cellnumbers=T)
+```
+
+
+# Part II. Plotting quality control of the parse samples
+
+This section is largely independent of the above and has a dependency on scrna/04, especifially the Parse dataset section. Please run that first. 
+
+
+```{r, fig_height}
+simpleCache("parse_samples_reference_table", {
+cts=meta %>% as.data.frame %>% group_by(parental, condition) %>% summarise(counts=n())
+cts}, reload=T, assignToVar="cts")
+
+for(i in 1:nrow(cts)){
+p=cts[i, "parental"] %>% as.character
+cond=cts[i, "condition"] %>% as.character
+  
+simpleCache(paste0("so_parse_selected_processed", p, cond), assignToVar="so", reload=T)
+
+ percent.mt<- PercentageFeatureSet(so, pattern = "^MT-") %>% givecolnames(., nms="percent.mt")
+ 
+ so@meta.data= cbind(so@meta.data,  percent.mt)
+
+ cluslabel="seurat_clusters"
+options(future.globals.maxSize = 2 * 10^9)
+fullreload=F; fullrecreate=T
+datte=chopstring(timestamp(""))
+verbose=F
+meth="deseq"
+groupvar="group"
+pvar="padj"
+thresh=pval
+fcvar="logFC"
+minrate=.1
+replicatecol="rep_num"
+
+#current working dataset
+
+simpleCache(paste_("seurat_parse_", p, cond, "_with_cbposmarkers", datte), {
+  nm=paste0("parse",p,cond)
+fcat(paste0("finding markers using the cb_pos_markers...\n") ) 
+
+simpleCache(paste_("cbposmarkers_parse_parental",p, "condition", cond,"on_clusters_of", cluslabel, datte), {
+  
+m=cb_pos_markers(so@assays$RNA@counts, grouping=so %>% metadata %>% pull(cluslabel) )
+  
+}, assignToVar="m", reload=F, recreate=T)
+
+   clusters=m %>% pull(group) %>% unique %>% as.numeric %>% sort
+ ## arrange and filter best markers
+    
+  if(is.null(selecttop)){
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC))
+  topstr=""  
+}else{
+  lt=lapply(clusters, function(x) m %>% filter(group==x,FDR<=fdr, logFC>=minfc, logCPM>=mincpm) %>% arrange(-logFC) %>% head(n=selecttop))
+}
+    mp=lt %>% Reduce(rbind,.)
+
+cat("Number of filtered markers: ", nrow(mp), "(", (nrow(mp)/nrow(m))*100, "% markers post filtering)\n")
+so$RNA@misc$markers <- m
+so$RNA@misc$top_markers <- mp
+cat("Dataset", nm, ": calculating residuals for missing genes in scale data...\n")
+so <- GetResidual(so, features = so$RNA@misc$top_markers$feature, verbose = F)
+}, assignToVar="so", reload=T)
+
+ qcplots(so, plotname=paste_("qcplots", "parsedatasets", nm),plot.title=nm, plotred="umap", demux="day", plotsize=20, path=params$plotpath, ww=1.5, hh=2.2, cutoffs=NULL, cellnumbers=T)
+ 
+}  
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

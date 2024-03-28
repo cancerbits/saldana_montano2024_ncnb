@@ -1,0 +1,19 @@
+[gene-expression]
+reference,/grphome/resources/cellranger_data/refdata-gex-GRCh38-2020-A/
+cmo-set,/prjhome/ncnb2_noncode/metadata/cmo-set_G4_GEX.csv
+[libraries]
+fastq_id, fastqs, feature_types
+G4_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L1/NCNB_10X_1_L4674/G4_GEX/,Gene Expression
+G4_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L2/NCNB_10X_1_L4674/G4_GEX/,Gene Expression
+G4_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L3/NCNB_10X_1_L4674/G4_GEX/,Gene Expression
+G4_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L4/NCNB_10X_1_L4674/G4_GEX/,Gene Expression
+G4_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L1/NCNB_10X_1_L4674/G4_BC/,Multiplexing Capture
+G4_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L2/NCNB_10X_1_L4674/G4_BC/,Multiplexing Capture
+G4_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L3/NCNB_10X_1_L4674/G4_BC/,Multiplexing Capture
+G4_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L4/NCNB_10X_1_L4674/G4_BC/,Multiplexing Capture
+[samples]
+sample_id,cmo_ids
+WT_D14_R2,BC41
+17q_D14_R2,BC42
+17qx_D14_R2,BC43
+17qMYCN_D14_R2,BC45

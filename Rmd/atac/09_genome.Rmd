@@ -1,0 +1,391 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Genome snapshots' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we generate genome-browser-like snaps visualizing the read coverage (and thus accessibility) 
+of assorted genomic loci for illustration.
+
+These plots feed into Figs. 8a,b of the paper.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+```
+
+Functions specifically used in this notebook.
+
+```{r def_genome_funcs}
+toBin <- function(coord, offset, res) {
+	round((as.numeric(coord) - as.numeric(offset)) / as.numeric(res))
+}
+extendAndFlipRegions <- function(regs, ext=1000) {
+	i <- start(regs)>end(regs)
+	tmp <- start(regs)
+	start(regs)[i] <- end(regs)[i]
+	end(regs)[i] <- tmp[i]
+
+	start(regs) <- pmax(start(regs)-ext, 0)
+	end(regs) <- end(regs)+ext
+	regs
+}
+themeCovPlot <- function(p, breaks_width=10000, pData=NULL) {
+	cols <- COLOR_PALETTES$sample_group
+	if(!is.null(pData)) cols <- cols[pData[,unique(sample_group)]]
+	p + xlab(sprintf("Linearized genome (chromosomal coordinate [mb], mean of %dbp bin)", GENOME_BIN_SIZE)) + ylab("Normalized read count") + scale_x_continuous(expand=c(0,0), breaks=function(x) seq(floor(min(x)/breaks_width)*breaks_width, ceiling(max(x)/breaks_width)*breaks_width, by=breaks_width) , labels=function(x) ifelse(order(x)==1 | order(x)==length(x), sprintf("%.1f", x/1000000),"")) + defTheme() + themeBoxed() + theme(legend.position="bottom") + scale_fill_manual(values=cols, guide="none") + scale_color_manual(values=cols, guide="none") # cowplot::theme_minimal_hgrid(line_size=0.25) + t
+}
+plotCoverageHM <- function(hm_data, gene_annot=NULL, sample_groups, id="x", row_annot=NA, annot_colors=NA, cell_width=NA, fn_col_agg = mean, ul=NULL, group_colors=COLOR_PALETTES$condition, no_numbers=FALSE, no_labels=FALSE) {	
+	colAnnotList <- list()
+	
+	if(!is.null(gene_annot)) colAnnotList$genes <- gene_annot
+	
+	grpMeans <- t(sapply(unique(sample_groups), function(x) { apply(hm_data[sample_groups==x,,drop=F], 2, fn_col_agg, na.rm=T)
+	} ))		
+	if(is.null(ul)) ul <- ceiling(max(grpMeans, na.rm=T))	
+	colAnnotList <- c(colAnnotList, sapply(unique(sample_groups), function(grp) {
+		axisParam <- ComplexHeatmap::default_axis_param("column")
+		if(no_numbers==TRUE) axisParam[["gp"]] <- grid::gpar(fontsize = 0)	
+		ComplexHeatmap::anno_barplot(grpMeans[grp,], axis_param=axisParam, gp=grid::gpar(fill=group_colors[[grp]], col=NA), ylim=c(0,ul))
+	}, simplify=F))
+	
+	gpx <- grid::gpar()
+	if(no_labels==TRUE) {
+		gpx <- grid::gpar(fontsize=0, col=NA)
+	}
+	ha <- ComplexHeatmap::HeatmapAnnotation(genes=colAnnotList$genes, psc=colAnnotList$psc, nmp=colAnnotList$nmp, nc=colAnnotList$nc, sap=colAnnotList$sap, sapm=colAnnotList$sapm, wt=colAnnotList$wt, chr17q=colAnnotList[["17q"]], chr17q1q=colAnnotList[["17q1q"]], chr17q1q_dox=colAnnotList[["17q1q_dox"]] , col=annot_colors, na_col="white", annotation_name_rot=90, annotation_name_gp=gpx)
+	
+	if(is.data.frame(row_annot)) {
+		row_annot <- ComplexHeatmap::HeatmapAnnotation(df=row_annot, which = "row", col=annot_colors)
+	}
+	
+	rowGaps <- cumsum(table(sample_groups)[unique(sample_groups)])
+	
+	p <- ComplexHeatmap::pheatmap(as.matrix(hm_data), cellwidth=cell_width, cellheight=10, gaps_row=rowGaps, show_colnames=F, column_title=id, name="Normalized read count", annotation_colors=annot_colors, right_annotation=row_annot,  top_annotation = ha,  border_color=NA, cluster_cols=F, cluster_rows=F, col=HEATMAP_COLORS)
+	# optional -- fix width: 	cellwidth=8  
+	return(p)
+}
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+geneAnnot <- latestCache(CACHE_GENE_ANNOT)
+dds <- latestCache(CACHE_ATAC_DDS)
+peaksDt <- latestCache(CACHE_ATAC_PEAKS)
+dA <- latestCache(CACHE_ATAC_META)
+```
+
+Pick genes for illustration and load annotations for exons/introns in a window around those genes. We chose POU5F1, SOX10, and PHOX2B as well-known examples of genes active at different stages of differentiation (i.e., in pluripotent stem cells, at the trunk neural crest stage, and in sympathoblasts, respectively).
+
+```{r def_genome_params}
+focusGenes <- c("POU5F1", "SOX10", "PHOX2B") 
+
+selRegions <- dtToGr(as.data.table(geneAnnot)[type=="gene" & gene_name%in%focusGenes & type=="gene",.(chrom=seqnames,start,end,reg_id=gene_name)], metaCols=c("reg_id"))
+names(selRegions) <- selRegions$reg_id
+selRegions <- selRegions[order(factor(names(selRegions), levels=focusGenes))]
+
+selExonAnnot <- geneAnnot[(as.character(seqnames(geneAnnot)) %in% peaksDt[,unique(chrom)]) & geneAnnot$type=="exon" & geneAnnot$gene_type=="protein_coding",]
+```
+
+Define parameters and constants used in the analysis:
+
+```{r def_genome_params2}
+sz <- sizeFactors(dds) # size factors calculated for normalization from DESeq2
+rm(dds)
+
+GENOME_BIN_SIZE <- 500 # size of bins
+GENOME_FLANK_SIZE <- 10000 # extend regions of interest by X bp in each direction
+HEATMAP_COLORS <- c("white", "#EEEEEE", "black") 
+```
+
+
+
+# Calculate coverage
+
+Get selected regions of interest:
+
+```{r get_regs}
+regs <- extendAndFlipRegions(selRegions, ext=GENOME_FLANK_SIZE)
+```
+
+Calculate coverage in bins through the selected regions:
+
+```{r calc_coverage}
+dtCov <- versionedCache("atac_cov", instruction={
+  # utility function to calculate the coverage from multiple BAM files in a selected genomic regions (divided into bins):
+  getCoverageInInterval <- function(reads, regs, res=50) {
+  	library(Rsubread)
+  
+    # define the bins in the regions of interest:
+  	bins <- rblapply(1:length(regs), function(i) {
+  		gr <- regs[i]
+  		s <- round(start(gr)/res)*res
+  		e <- round(end(gr)/res)*res
+  		if(s > e) {
+  			x <- s; s <- e; e <- x
+  		}
+  		bins <- data.table(Chr=as.character(seqnames(gr)), Start=seq(s,e-res,by=res), End=seq(s+res,e,by=res), Strand=as.character(strand(gr)))
+  		bins[,bin_num:=1:.N]
+  		bins[,GeneID:=paste_(i,bin_num)]
+  		bins
+  	}, "reg_id")
+  	setkey(bins, GeneID)
+  	
+  	# then use featureCounts to calcuate the overlapping read counts:
+  	dtCov <- Rsubread::featureCounts(reads, annot.ext=as.data.frame(bins), allowMultiOverlap=T, strandSpecific=0, nthreads=config$n_threads_max)
+  	colnames(dtCov$counts) <- names(reads)		
+  	dtCov <- melt(as.data.table(dtCov$counts,keep.rownames="bin_id"), id.vars="bin_id", variable.name="library_name", value.name="count")
+  	dtCov <- cbind(dtCov, bins[dtCov$bin_id,.(reg_id,bin_num,bin_start=Start,bin_end=End)])
+  	dtCov
+  }
+  
+  # execute the utility function for all our samples and the previously selected regions of interest:
+	dtCov <- getCoverageInInterval(with(annot[, .(library_name, bam_file=getBamPath(pipe_name))], structure(bam_file, names=library_name)), sel_regions, res=bin_size)
+
+	# extend metadata:
+	dtCov <- merge(annot, dtCov, by.x="library_name", by.y="library_name")
+	dtCov[, `:=`(c("reg_id", "chrom", "start", "end"), as.data.table(regs)[dtCov$reg_id, .(reg_id, seqnames, as.numeric(start), as.numeric(end))])]
+	dtCov[, reg_info:= sprintf("%s\n%s:%s-%s (%.1f kb)", reg_id, chrom, prettyIntegers(start), prettyIntegers(end), (end-start)/1000)]
+		
+	# scale coverage:
+	dtCov[, size_factor := 1/sz[library_name]] # use the same size factors as used to scale read counts in heatmaps / PCA / etc.
+	dtCov[, norm_val := count*size_factor]
+
+	return(dtCov)
+}, buildEnvir=list(
+  sel_regions=regs,
+  annot=dA[, .(library_name, pipe_name, day_fac, condition, sample_group)],
+  bin_size=GENOME_BIN_SIZE
+))
+```
+
+Get all gene exon annotations within the selected windows:
+
+```{r get_exons}
+ex <- as.data.table(extendAndFlipRegions(selExonAnnot,ext=0))
+feats <- rblapplyDT(as.data.table(regs), function(reg) {
+	feats <- ex[seqnames==as.character(reg$seqnames) & start<as.numeric(reg$end) & end>as.numeric(reg$start),]
+	
+	# cut off at region boundaries:
+	feats[, s:=pmax(as.numeric(reg$start), as.numeric(start))]
+	feats[, e:=pmin(as.numeric(reg$end), as.numeric(end))]	
+	
+	return(feats)
+}, "reg_id")
+```
+
+
+
+# Make plots
+
+Select region/sample combinations to plot:
+
+```{r def_cov_sels}
+coverageSelections <- list(
+  # wild-type samples at different time points to illustrate differentiation-related changes:
+	by_time_WT = list(
+  	regions = unlist(na.omit(sapply(focusGenes, function(g) which(regs$reg_id==g)))),
+  	samples = dtCov[condition=="WT",unique(library_name)],
+  	group_by = "day_fac",
+  	group_order = DAY_ORDER,
+  	annots = c("day_fac")
+	),
+	# samples from different cell lines at fixed time point to illustrate differences between conditions:
+	by_condition_D19 = list(
+		regions = unlist(na.omit(sapply(focusGenes, function(g) which(regs$reg_id==g)))),
+		samples = dtCov[day_fac=="D19",unique(library_name)],
+		group_by = "condition",
+		group_order = CONDITION_ORDER,
+		annots = c("condition")
+	)
+)
+```
+
+Generate genome-browser-like coverage visualizations:
+
+```{r cov_plots_1}
+COLOR_PALETTES$sample_group <- with(unique(dA[, .(col=COLOR_PALETTES$day[day_fac], sample_group)]), structure(col, names=sample_group))
+
+ps <- sapply(names(coverageSelections), function(n) {
+	# coverage tracks:
+	selPlots <- dtCov[,unique(reg_info)]
+	trackOrder <- c("Genes",dA[order(sample_order), gsub("atac_","",library_name)])
+	grpOrder <- c("Genes",dA[order(sample_order), unique(sample_group)])
+	dtCov[, library_name_x := factor(gsub("atac_","",library_name),levels=trackOrder)]
+	dtCov[, sample_group_x := factor(sample_group,levels=grpOrder)]
+	
+	covPlots <- sapply(selPlots, function(rid) {
+		pData <- dtCov[reg_info==rid & library_name%in%coverageSelections[[n]]$samples,]	 
+		#lbl <- gsub("\\s+","\n",gsub(",","",rid))
+		pData[,reg_lbl:=sprintf("%s\n%.1f-%.1fmb", chrom, start/1000000, end/1000000)]
+		lbl <- pData[,unique(reg_lbl)]
+		#pData[, norm_val:=log2(norm_val+1)]
+		msg(rid)
+
+		s <- pData[,min(start)]
+		e <- pData[,max(end)]
+		chr <- pData[,as.character(unique(chrom))]
+		
+		regPeaks <- peaksDt[chrom==chr & end>=s & start<=e, ]
+		
+		curFeats <- feats[reg_id%in%pData$reg_id,]
+		curFeats[, capped_s:=round(pmax(start, s)/GENOME_BIN_SIZE)*GENOME_BIN_SIZE]
+		curFeats[, capped_e:=round(pmin(e,end)/GENOME_BIN_SIZE)*GENOME_BIN_SIZE]
+		
+		curFeats <- unique(curFeats[, .(strand, capped_s, capped_e, gene_symbol=gene_name)])
+		curFeats[, ex_num:=1:.N, by=gene_symbol]
+		curFeats[, library_name_x:="Genes"]
+		curFeats[, sample_group_x:="Genes"]
+		curFeats[, reg_lbl:=lbl]
+		curFeats[, norm_val:=0]
+		
+		curFeats[, n_gene:=as.numeric(as.factor(gene_symbol))]
+		
+		curFeats[, g_start:=ifelse(strand=="+",min(capped_s),max(capped_e)), by=gene_symbol]
+		curFeats[, g_end:=ifelse(strand=="+",max(capped_e),min(capped_s)), by=gene_symbol]
+		
+		off <- s		
+		p <- ggplot(pData, aes(x=(bin_start+bin_end)/2, y=norm_val, fill=sample_group, color=sample_group)) 
+		
+		gStep <- pData[,ceiling(max(norm_val))/max(4, curFeats[,max(n_gene)])]
+		
+		p <- p + geom_segment(aes(x=g_start, xend=g_end, y=(n_gene+0.4)*gStep, yend=(n_gene+0.4)*gStep), inherit.aes=F, lineend="butt", linejoin="bevel", arrow=arrow(length=unit(0.25,"cm")), data=unique(curFeats[, .(library_name_x, sample_group_x, g_start, g_end, n_gene)]))
+		
+		p <- p + geom_rect(aes(xmin=capped_s, xmax=capped_e, ymin=n_gene*gStep, ymax=(n_gene+0.8)*gStep), fill="black", inherit.aes=F, data=curFeats)
+		p <- p + ggrepel::geom_text_repel(aes(x=center, y=(gStep)*(n_gene-0.1), label=gene_symbol), size=3, vjust=0, color="black", inherit.aes=F, data=curFeats[, .(center=(max(capped_e) + min(capped_s)) / 2 ), by=.(library_name_x, sample_group_x, n_gene, gene_symbol)]) #color="black", 
+		
+		px <- themeCovPlot(p + geom_area(aes(group=library_name), position="identity", color="transparent", fill="black", size=0.5, alpha=0.35) + facet_grid(factor(sample_group_x, levels=grpOrder)~reg_lbl, scale="free_x", space="free") , pData=pData)
+		
+		return( list(plot = px, data = pData) ) 
+	}, simplify=F)
+
+	#pdfPlot(paste_("coverage_roi_sel",n), 5, 4) #5
+	selPlots <- names(covPlots)
+	selPlots <- sapply(selPlots, function(n) {
+		i <- which(selPlots==n)
+		p <- covPlots[[n]]$plot
+		
+		if(i > 1) {
+			p <- p + theme(axis.title.y = element_blank() )
+		}
+		if(i < length(selPlots)) {
+			p <- p + theme(strip.text.y = element_blank())
+		}
+		if(i != round(length(selPlots)/2)) {
+			p <- p + theme(axis.title.x = element_blank() )
+		}
+		
+		return(p)
+	}, simplify=F)
+	print( patchwork::wrap_plots( selPlots, nrow=1) + ggtitle(n) )
+	#dev.off()
+	
+	return( list(plots = selPlots, data = rblapply(selPlots, function(x) x$data ), "region" ) )
+}, simplify=F)
+```
+Compile into figure panels (Fig. 8a,b):
+
+```{r cov_plots_1_all, fig.width=20, fig.height=8}
+p <- patchwork::wrap_plots( unlist(lapply(ps, function(x) x$plots), recursive=FALSE) , nrow=1)
+print(p)
+
+ggsave(filename = figuresDir("figure_atac_gbrowse.pdf"), plot = p, width = 10, height = 5, dpi = 600, unit = "in")
+fwrite(rblapply(ps, function(x) x$data, "example_type")[,.(example_type, reg_id, condition, day=day_fac, sample_group, bin_num, bin_start, bin_end, count, size_factor, norm_val)], file = figuresDir("figure_atac_gbrowse_data.csv"))
+```
+
+Alternative plots showing the coverage heatmaps (not shown in the paper):
+
+```{r cov_plots_2}
+annotColors <- COLOR_PALETTES[c("day_fac","condition")]
+annotColors$genes <- c("-"="white",intron="lightgrey",exon="black")
+
+ul <- 200
+
+for(n in names(coverageSelections)) {
+	p <- sapply(coverageSelections[[n]]$regions, function(regI) {
+		reg <- regs[regI]
+		print(regI)
+		
+		off <- start(reg)
+			
+		hmData <- dtToDf(dcast(dtCov[library_name%in%coverageSelections[[n]]$samples & reg_id==reg$reg_id,], factor(gsub("atac_","",library_name),levels=dA[order(sample_order), gsub("atac_","",library_name)])~bin_num, value.var="norm_val"))
+		
+		coveredBins <- rep("-", ncol(hmData))
+		
+		curFeats <- feats[gene_name==reg$reg_id,]
+		curFeats[, s:=toBin(start, offset=off, res=GENOME_BIN_SIZE)]
+		curFeats[, e:=toBin(end, offset=off, res=GENOME_BIN_SIZE)]		
+		for(i in 1:nrow(curFeats)) {
+			coveredBins[curFeats[i, s]:curFeats[i,e]] <- "exon"
+		}	
+		i <- which(coveredBins=="exon")
+		coveredBins[setdiff(min(i):max(i), i)] <- "intron"
+		colAnnot <- data.frame(gene=coveredBins)
+		rownames(colAnnot) <- colnames(hmData)
+		
+		geneAnnot <- coveredBins		
+		rowAnnot <- dtToDf(dA[,c("library_name", coverageSelections[[n]]$annots), with=FALSE])
+		rownames(rowAnnot) <- gsub("atac_","",rownames(rowAnnot))
+		rowAnnot <- rowAnnot[rownames(hmData),,drop=FALSE]
+		grps <- rowAnnot[,coverageSelections[[n]]$group_by]
+		
+		p <- plotCoverageHM(hmData, gene_annot=geneAnnot, annot_colors=sapply(annotColors, unlist, simplify=F), sample_groups=grps, row_annot=rowAnnot, id=reg$reg_id, cell_width=2, group_colors=COLOR_PALETTES[[coverageSelections[[n]]$group_by]], ul=200)
+		ComplexHeatmap::draw(p)
+		
+		noNum <- FALSE
+		noLbls <- FALSE
+		if(regI > 1)  {
+			noNum <- TRUE
+		}
+		if(regI < length(coverageSelections[[n]]$regions)) {
+			noLbls <- TRUE
+			rowAnnot <- NULL
+		}
+			
+		p <- plotCoverageHM(hmData, gene_annot=geneAnnot, annot_colors=sapply(annotColors, unlist, simplify=F), sample_groups=grps, row_annot=rowAnnot, no_labels=noLbls, no_numbers=noNum, id=reg$reg_id, group_colors=COLOR_PALETTES[[coverageSelections[[n]]$group_by]], ul=200) # row annotations only on left-most heatmap for compound plot! 
+			
+		return(p)	
+	}, simplify=F)
+
+	htList <- NULL
+	for(ht in p) {
+		htList <- htList + ht
+	}
+	ComplexHeatmap::draw(htList)
+	
+}
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

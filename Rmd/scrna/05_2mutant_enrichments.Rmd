@@ -1,0 +1,358 @@
+---
+title: 'Saldana, Montano, et al. -- scRNA-seq: 052 Comparison of MUT vs. WT' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+# Differential gene expression between the mutants and the wild type
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+
+library(data.table)
+library(Seurat)
+library(simpleCache)
+library(ggplot2)
+```
+
+Functions specifically used in this notebook.
+
+```{r def_mut_funcs}
+resultsDir <- function(...) {
+  paste0(config$out_root, "/scrna/", ...)
+}
+options("RCACHE.DIR"=file.path(config$out_root, "rcache"))
+```
+
+Load required input data from previous steps:
+
+```{r load_caches}
+dUse <- "sctscvi"
+selStage <- c("D9")
+bgCond <- "WT"
+fgConds <- c("17q", "17q1q", "17q1qMYCN")
+
+inCache <- "sma_fulldataset_with_mutscore_D9_D14_D19"
+simpleCache::simpleCache(inCache, assignToVar='so')
+
+so@meta.data$condition <- gsub("^c","", so@meta.data$ccondition)
+so@meta.data$condition <- factor(so@meta.data$condition, levels=intersect(CONDITION_ORDER, unique(so@meta.data$condition)))
+
+inputDataVersion <- inCache #digest::digest(so)
+```
+
+
+# Get HALLMARK gene sets
+
+Retrieve HALLMARK gene sets from MSigDB:
+
+```{r get_hallmarks}
+hallmarkGenes <- as.data.table(msigdbr::msigdbr(species = "human", category = "H"))
+hallmarkGeneSets <- split(hallmarkGenes$gene_symbol, f=hallmarkGenes$gs_name)
+print(sapply(hallmarkGeneSets, length))
+```
+
+
+
+# Get chromosome arm coordinates
+
+Retrieve cytoband annotations from Ensembl (use v98, which matches the 10x gene reference used, see https://support.10xgenomics.com/single-cell-gene-expression/software/release-notes/build):
+
+```{r get_cyto_genes}
+ens <- biomaRt::useEnsembl(biomart = 'genes', dataset = 'hsapiens_gene_ensembl', version = '98')
+cyto <- biomaRt::getBM(attributes =c("ensembl_gene_id","external_gene_name","chromosome_name","band"),mart=ens)
+cyto <- as.data.table(cyto)
+cyto[, simple_band := gsub("\\.\\d+$","",band)]
+
+# these are the CNV coordinates according to the cytogenetic analysis:
+cyto17q <- paste0("q", 11:27)
+cyto1q <- c(paste0("q", 21:44))
+```
+
+Mark genes within 17q and 1q:
+
+```{r mark_cyto_genes}
+sub17cyto <- intersect(rownames(so), unique(cyto[simple_band%in%cyto17q & chromosome_name=="17", external_gene_name]))
+sub1cyto <- intersect(rownames(so), unique(cyto[simple_band%in%cyto1q & chromosome_name=="1", external_gene_name]))
+
+featsCNV <- c(sub1cyto,sub17cyto)
+featsNonCNV <- setdiff(rownames(so), featsCNV)
+```
+
+
+
+# Run differential expression tests
+
+Subset to cells of the selected differentiation stage(s):
+
+```{r filt_data}
+soFilt <- subset(so, subset=(stage%in%selStage))
+soFilt@meta.data$day_rep <- paste_(soFilt@meta.data$stage, soFilt@meta.data$replicate)
+Idents(soFilt) <- "condition"
+```
+
+
+
+Run DE test (with DElegate, see https://github.com/cancerbits/DElegate):
+
+```{r run_delegate}
+DefaultAssay(soFilt) <- "RNA"
+deRes <- rblapply(fgConds, function(fg) {
+  msgF("%s vs %s", fg, bgCond)
+  m <- DElegate::findDE(soFilt, group_column="condition", compare=c(fg, bgCond), method="deseq", replicate_column = "day_rep")
+	return(as.data.table(m))
+}, "foreground", cores=length(fgConds))
+deRes <- deRes[ave_expr!=0 & (rate1 >= 0.2 | rate2 >= 0.2),] # keep only genes found expressed in >X% of cells in at least one group (similar to Seurat pre-filter)
+deRes[, sig := padj<=0.05 & abs(log_fc)>=0.25]
+deRes[, dir := ifelse(log_fc>0, "de_up", "de_down")]
+deRes[, sig_dir := ifelse(sig==T, dir, "non_de")]
+```
+
+
+
+# Evaluate results
+
+Mark genes in chr17q or chr1q and count number of DEGs by CNV membership:
+
+```{r}
+deRes[, is_1q := feature %in% sub1cyto]
+deRes[, is_17q := feature %in% sub17cyto]
+deRes[, `Gene locus` := as.factor(ifelse(is_17q==T, "chr17q", ifelse(is_1q==T, "chr1q", "Non-CNV")))]
+
+allTestedGenes <- unique(deRes[,.(foreground="all", sig_dir="all", is_17q, is_1q, feature)])
+
+degSummary <- rbind(
+	deRes[, .(.N, is_17q=sum(is_17q), is_1q=sum(is_1q), perc_17q=round(sum(is_17q)/.N*100,2), perc_1q=round(sum(is_1q)/.N*100,2)), by=.(foreground, sig_dir)],
+	allTestedGenes[, .(.N, is_17q=sum(is_17q), is_1q=sum(is_1q), perc_17q=round(sum(is_17q)/.N*100,2), perc_1q=round(sum(is_1q)/.N*100,2)), by=.(foreground, sig_dir)]
+)
+print(degSummary)
+
+
+fwrite(degSummary, file = figuresDir("figure_mutvswt_table_data.csv"))
+
+
+fwrite(deRes[sig==T & `Gene locus`!="Non-CNV", .(comparison=paste(group1, "vs", group2), gene_symbol=feature, rate1=sprintf("%.2f", rate1), rate2=sprintf("%.2f", rate2), log_fc=sprintf("%.4f", log_fc), pval=sprintf("%.4f", pvalue), padj=sprintf("%.4f", padj), `Gene locus`)], figuresDir("supp_tbl_mut_de_res.csv")) 
+
+
+fwrite(deRes[sig==T,], file=resultsDir("mut_de_res.csv.gz"))
+```
+
+```{r}
+p1 <- ggplot(deRes[sig==T,][,.N,by=.(foreground, `Gene locus`, dir)], aes(x=factor(foreground, levels=CONDITION_ORDER), y=ifelse(dir=="de_up", 1, -1) * N)) + 
+		geom_bar(aes(fill=`Gene locus`), stat="identity", position="stack") + 
+		cowplot::theme_cowplot() + 
+		xlab(NULL) + ylab("N") +
+		geom_hline(yintercept=0)
+
+print(p1)
+```
+Run functional enrichment analysis using hypeR:
+
+```{r run_hyper, fig.width=11, fig.height=8}
+deResSig <- deRes[sig==TRUE,]
+
+# define gene lists by DEG-status and chromosomal location:
+geneLists <- unlist(list(
+	"all" = split(deResSig$feature, f=deResSig[, paste_(foreground, sig_dir)]),
+	"chr17q" = split(deResSig[is_17q==TRUE, feature], f=deResSig[is_17q==TRUE, paste_(foreground, sig_dir)]),
+	"chr1q" = split(deResSig[is_1q==TRUE, feature], f=deResSig[is_1q==TRUE, paste_(foreground, sig_dir)]),
+	"nonCNV" = split(deResSig[!(is_1q | is_17q), feature], f=deResSig[!(is_1q | is_17q), paste_(foreground, sig_dir)])
+), recursive=FALSE)
+
+# run ewnrichment tests:
+hallmarkEnrichRes <- rblapply(names(geneLists), function(mod) {
+	msg("\t\t",  mod)
+	as.data.table(canceRbits::cb_hyper(geneLists[[mod]], background = rownames(so), genesets = hallmarkGeneSets, collapse=F, verbose=F))
+}, "grp") 
+
+# derive attributes:
+hallmarkEnrichRes[, jacc:=overlap/(signature + geneset - overlap)]
+hallmarkEnrichRes[, perc:=overlap/signature]
+hallmarkEnrichRes[, perc_bg:=geneset/background]
+hallmarkEnrichRes[, odds:=log2(perc/perc_bg)]
+hallmarkEnrichRes[, log2odds:=log2(perc/perc_bg)]
+hallmarkEnrichRes[!is.finite(log2odds), log2odds:=hallmarkEnrichRes[is.finite(log2odds),min(log2odds,na.rm=T)]*1.1]
+hallmarkEnrichRes[, padj:=fdr]
+hallmarkEnrichRes[, mlogp:=-log10(pval)]
+hallmarkEnrichRes[, mlogpadj:=-log10(padj)]
+hallmarkEnrichRes[, perc100:=perc*100]
+hallmarkEnrichRes[, mlog2odds:=-log2odds]	
+hallmarkEnrichRes[, foreground := gsub("^.+\\.([^\\.]+)_de_(up|down)","\\1",grp)]
+hallmarkEnrichRes[, gene_sel := gsub("^(.+)\\.([^\\.]+)_de_(up|down)","\\1",grp)]
+hallmarkEnrichRes[, pw_lbl:=gsub("HALLMARK_","",label)]
+hallmarkEnrichRes[, sig:=is.finite(log2odds) & is.finite(padj) & is.finite(perc) & padj<=0.1] 
+hallmarkEnrichRes[, dir := ifelse(grepl("up$",grp), 1, -1)]
+hallmarkEnrichRes[, val := dir * jacc] 
+
+hallmarkEnrichRes[dir==-1, `Higher in` := bgCond]
+hallmarkEnrichRes[dir==1, `Higher in` := foreground]
+
+# write results table:
+fwrite(hallmarkEnrichRes[sig==T,], resultsDir("hallmark_hypeR.csv.gz")) 
+
+
+fwrite(hallmarkEnrichRes[sig==T, .(comparison=paste(foreground, "vs", bgCond), `Higher in`, gene_sel, label, signature, geneset, overlap, background, hits, jacc=sprintf("%.4f", jacc), pval=sprintf("%.4f", pval), padj=sprintf("%.4f", padj))], figuresDir("supp_tbl_hallmark_hypeR.csv")) 
+```
+
+```{r plot_hyper, fig.width=11, fig.height=8}
+selHallmarkRes <- hallmarkEnrichRes[label%in%hallmarkEnrichRes[sig==T, label],]
+hmDataP <- dtToDf(dcast(selHallmarkRes, grp~gsub("HALLMARK_","",label), value.var="fdr"))
+hmData <- abscap(dtToDf(dcast(selHallmarkRes, grp~gsub("HALLMARK_","",label), value.var="jacc")))
+pheatmap::pheatmap(hmData, display_numbers=pToSig(hmDataP), number_color="black", cellheight=10, cellwidth=10, scale="none", main="Jaccard index and FDR") #file=resultsDir("hallmark_hypeR.pdf"), 
+```
+
+Focus on chr1q- and chr17q-linked DEGs, only show pathways enriched for at least one of those:
+
+```{r plot_cnv_enrich}
+selHallmarkRes <- hallmarkEnrichRes[label%in%hallmarkEnrichRes[grepl("^chr17?q",grp) & sig==T, label],][grepl("^chr17?q",grp), ]
+hmDataP <- dtToDf(dcast(selHallmarkRes, grp~gsub("HALLMARK_","",label), value.var="fdr"))
+hmData <- abscap(dtToDf(dcast(selHallmarkRes, grp~gsub("HALLMARK_","",label), value.var="jacc")))
+pheatmap::pheatmap(hmData, color=RColorBrewer::brewer.pal(9, "PuRd"), display_numbers=pToSig(hmDataP), number_color="black", cluster_cols = ncol(hmData)>1, cellheight=10, cellwidth=10, scale="none") #file=resultsDir("hallmark_hypeR_chr1q_chr17q.pdf"), 
+
+pData <- rblapply(selHallmarkRes[,unique(label)], function(n) {
+	msg(n)
+  
+	curGenes <- suppressWarnings(sort(unique(unlist(selHallmarkRes[label==n, strsplit(hits,",")]))))
+	
+	# get data matrix:		
+	hmData <- as.matrix(soFilt@assays[[dUse]]@data[curGenes, ,drop=F])	
+	hmDataS <- t(apply(hmData, 1, scale))
+	dimnames(hmDataS) <- dimnames(hmData)
+		print(curGenes)
+
+	# % expressed
+	percData <- sapply(split(rownames(soFilt@meta.data), f=soFilt@meta.data$condition), function(chunkCellIds) {
+		apply(hmData[, chunkCellIds], 1, function(x) { sum(x>0, na.rm=T)/length(x) })
+	})[, c(bgCond, fgConds)]	
+	percDataDiff <- percData / percData[,bgCond]
+			
+	# calculate pseudo-bulks:
+	hmDataS <- sapply(split(rownames(soFilt@meta.data), f=soFilt@meta.data$condition), function(chunkCellIds) {
+		rowMeans(hmDataS[, chunkCellIds], na.rm=T)
+	})[, c(bgCond, fgConds)]
+	hmData <- sapply(split(rownames(soFilt@meta.data), f=soFilt@meta.data$condition), function(chunkCellIds) {
+		rowMeans(hmData[, chunkCellIds], na.rm=T)
+	})[, c(bgCond, fgConds)]	
+	hmDataDiff <- hmData - hmData[,bgCond]
+	
+	rc <- hclust(dist(hmData))
+	
+	percDataDiffM <- reshape2::melt(percDataDiff)
+	setnames(percDataDiffM, c("Var1","Var2","value_perc_diff"))
+	pData <- merge(merge(merge(merge(reshape2::melt(hmData), reshape2::melt(percData), by=c("Var1","Var2"), suffixes=c("_expr","_perc")), reshape2::melt(hmDataS), by=c("Var1","Var2"), suffixes=c("","_scaled")),  reshape2::melt(hmDataDiff), by=c("Var1","Var2"), suffixes=c("_scaled","_diff")),  percDataDiffM, by=c("Var1","Var2"), suffixes=c("","_pdiff"))
+	return(pData)
+}, "gs_name")
+
+pData[, gs_name_simple := gsub("HALLMARK_","",gs_name)]
+
+
+selHallmarkSetsX <- selHallmarkRes[,unique(label)]
+	
+pDataX <- pData[gs_name%in%selHallmarkSetsX,]	
+pwLabelFinal <- pDataX[, paste(sort(unique(gs_name_simple)), collapse="/"), by=Var1]
+pwLabelFinal <- structure(pwLabelFinal$V1, names=as.character(pwLabelFinal$Var1))
+pDataX[, pw_label_final := pwLabelFinal[as.character(Var1)] ]
+```
+
+```{r plot_cnv_genes_2, fig.width=9, fight.height=2}
+hmData <- as.matrix(dtToDf(dcast(pDataX, factor(Var2, levels=(c(bgCond, fgConds)))~Var1, value.var="value_diff", fun.aggregate=mean)))
+colAnnot <- t(dtToDf(dcast(pDataX, gs_name_simple~Var1, value.var="value_diff"))>0)*1
+loc <- ifelse(rownames(colAnnot)%in%sub17cyto, "Genes on chr17q", ifelse(rownames(colAnnot)%in%sub1cyto, "Genes on chr1q", "???"))
+
+o <- order(loc, colAnnot[,1])
+if(ncol(colAnnot)>1) o <- order(loc, colAnnot[,1], colAnnot[,2])
+
+#hm <- ComplexHeatmap::pheatmap(hmData[,o], 
+#	col=circlize::colorRamp2(seq(-1,1, length.out=5), rev(RColorBrewer::brewer.pal(5,"RdBu"))),
+#	cellheight=10, cellwidth=10, 
+#	column_split=loc[o], 
+#	cluster_rows=FALSE, 
+#	cluster_cols=FALSE,
+#	annotation_col=colAnnot[o,,drop=FALSE], 
+#	annotation_colors=apply(colAnnot, 2, function(x) c("1"="black","0"="white"), simplify=F)
+#)
+#ComplexHeatmap::draw(hm)
+
+forEach(c("chr17q","chr1q"), function(curCNV) {
+  msg(curCNV)
+	pathwaysCNV <- hallmarkEnrichRes[sig==T & gene_sel==curCNV, pw_lbl, drop=F]
+	if(length(pathwaysCNV) > 0) {
+  	selGenes <- names(which(rowSums(as.matrix(colAnnot[, pathwaysCNV, drop=F]))>0 & loc==paste("Genes on", curCNV)))
+  	hmDataCNV <- hmData[, selGenes, drop=FALSE]
+  	colAnnotCNV <- colAnnot[selGenes, pathwaysCNV, drop=FALSE]		
+  	oCNV <- 1:nrow(hmDataCNV)
+  	if(ncol(colAnnotCNV)==2) oCNV <- order(colAnnotCNV[selGenes,1], colAnnotCNV[selGenes,2])
+  	if(ncol(colAnnotCNV)==3) oCNV <- order(colAnnotCNV[selGenes,1], colAnnotCNV[selGenes,2], colAnnotCNV[selGenes,3])
+  	
+  	hmDataX <- hmDataCNV[,oCNV,drop=FALSE]
+  	hm <- ComplexHeatmap::pheatmap(hmDataX, 
+  				color=circlize::colorRamp2(seq(-1,1, length.out=5), rev(RColorBrewer::brewer.pal(5,"RdBu"))),
+  				cellheight=10, cellwidth=10, 
+  				main=curCNV,
+  				cluster_rows=FALSE, 
+  				cluster_cols=FALSE,
+  				annotation_col=colAnnotCNV[oCNV,,drop=FALSE], 
+  				annotation_colors=apply(colAnnotCNV, 2, function(x) c("1"="black","0"="white"), simplify=F)
+  			)
+  			
+  	ComplexHeatmap::draw(hm)
+  	
+  	pdf(figuresDir("figure_mutvswt_hm_", curCNV, ".pdf"), width=12, height = 4)
+  	ComplexHeatmap::draw(hm)
+  	dev.off()
+  	
+  	
+  	
+    # export figure data:
+    fwrite(as.data.table(rbind(t(colAnnotCNV[colnames(hmDataX),]), hmDataX), keep.rownames = "Locus / pathway"), file = figuresDir("figure_mutvswt_hm_", curCNV, ".csv"))
+	}
+})
+```
+	
+```{r plot_cnv_genes_4, fig.width=12, fig.height=4}			
+pData <- hallmarkEnrichRes[gene_sel!="all" & paste_(gene_sel,label)%in%hallmarkEnrichRes[sig==T, .SD[order(pval), head(paste_(gene_sel,label), n=5)], by=gene_sel][,V1],] 
+	
+#pData[, `Higher in` := factor(dir, levels=c(-1,1), labels=c("WT", "MUT"))]
+#pData[dir==-1, `Higher in` := bgCond]
+#pData[dir==1, `Higher in` := foreground]
+
+p1 <- ggplot(pData, aes(y=reorder(pw_lbl,val), x=val)) + 
+		geom_bar(aes(fill=`Higher in`), stat="identity") + 
+		cowplot::theme_cowplot() + 
+		ylab(NULL) + xlab("Jaccard index") +
+		geom_vline(xintercept=0) +
+		scale_fill_manual(values=COLOR_PALETTES$condition[unique(pData[,`Higher in`])]) + #scale_fill_manual(values=c("MUT"="red", "WT"="blue")) +
+		facet_grid(gene_sel ~ factor(foreground,levels=fgConds), space="free_y", scales="free_y")
+print(p1)
+
+
+# export figure data:
+ggsave(filename = figuresDir("figure_mutvswt.pdf"), plot = p1, width = 12, height = 4, dpi = 600, unit = "in")
+fwrite(pData[, .(gene_sel, foreground, `Higher in`, pw_lbl, val)], file = figuresDir("figure_mutvswt.csv"))
+```
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

@@ -1,0 +1,1179 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Comparisons to public data' 
+author: 'Sara Wernig-Zorc & Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we interrogate the accessibility of our ATAC-seq peaks and the
+activity of TF target gene sets in external datasets. 
+
+These plots feed into Supplementary Figs. 4, 7, 13, 14 of the paper.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(ComplexHeatmap)
+library(plyranges)
+library(R.utils)
+library(tidyverse)
+```
+
+Load required input data from previous steps:
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS_ANNOTATED)
+dds <- latestCache(CACHE_ATAC_DDS)
+dA <- latestCache(CACHE_ATAC_META)
+selRegions <- latestCache(CACHE_ATAC_REGION_ORDER)
+```
+
+Functions specifically used in this notebook.
+
+```{r def_funcs}
+gunzipX <- function(f) {
+  unzipped <- gsub(".gz$","",f)
+  if(grepl(".gz", f) & !file.exists(unzipped)) {
+    R.utils::gunzip(f)
+  }
+  return(unzipped)
+}
+loadAndCacheWig <- function(x) {
+  versionedCache("wig_profile", instruction={
+    f <- wig_url
+    if(!file.exists(f)) f <- getExternalFile(basename(wig_url), wig_url)
+    plyranges::read_bigwig(f)
+  }, buildEnvir=list(wig_url=x))
+} 
+
+doGSEA <- function(external_data, peak_annot) {
+  external_data <- external_data[!is.na(external_data[,1]),]
+  peak_annot <- peak_annot[rid%in%rownames(external_data),]
+  
+  gs <- split(peak_annot$rid, f=peak_annot$all_mods_id)
+  gs <- gs[setdiff(names(gs), "BG")] # the "BG" region set is huge and causes the analysis to take a very long time. take it out!
+  
+  print(sapply(gs, length))
+  print(dim(external_data))
+  #print(head(external_data))
+  
+  pData <- rblapply(colnames(external_data), function(ds_name) {
+    print(paste("start",ds_name))
+    x <- external_data[,ds_name]
+    names(x) <- rownames(external_data)
+    x <- x[is.finite(x)]
+    print(head(x))
+    res <- canceRbits::cb_fgsea(genes = names(x),
+                       genesets = gs,
+                       scores = x,
+                       max_size = Inf)
+    print(paste("done",ds_name))
+    return(res)
+  }, "dataset", cores=min(ncol(external_data), config$n_threads_max))
+  
+  return(pData)
+}
+
+
+PADJ_THRESH <- 0.05
+
+options(timeout=9999) # increase timeout for download.file
+```
+
+Normalize count data:
+
+```{r norm_data}
+dVst <- SummarizedExperiment::assay(DESeq2::vst(dds))
+```
+
+Prepare genomic regions:
+
+```{r prep_peaks}
+peaksGr <- dtToGr(peaksDt, metaCols=c("rid", "all_mods_id"))
+```
+
+
+# Lift over
+
+Many older datasets are based on the hg19 (GRCh37) genome assembly (from 2009), while we used the latest production assesmbly available to use at the time, i.e., hg38 (GRCh38; from 2013). To establish a mapping for our peaks between assesmblies, we use liftOver.
+
+```{r}
+peaksGrHg19 <- liftOver(peaksGr, from="hg38", to="hg19")
+
+print(peaksGr)
+print(peaksGrHg19)
+```
+
+Some regions have up to 16 mappings in hg19:
+
+```{r}
+#table(sapply(peaksGrHg19, nrow))
+peaksDtHg19 <- with(list(gr=unlist(peaksGrHg19)), data.table(grToDt(gr), rid=gr$rid, all_mods_id=gr$all_mods_id))
+peaksDtHg19[, ambiguity := .N, by=rid]
+peaksDtHg19[, .N, by=ambiguity][order(ambiguity),]
+peaksDtHg19[ambiguity!=1, .N, by=all_mods_id]
+```
+We'll be conservative and use only unique mappings:
+
+```{r}
+peaksDtHg19 <- peaksDtHg19[ambiguity==1, ]
+peaksGrHg19 <- dtToGr(peaksDtHg19, metaCols = c("rid", "all_mods_id"))
+setkey(peaksDtHg19, rid)
+```
+
+
+
+
+
+
+
+
+
+
+
+# Chromatin modules in public ATAC-seq data
+
+
+```{r}
+gseaRes <- list()
+```
+
+
+## Dataset GSE138293 (hg19)
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE138293
+
+Samples:
+GSM4104571	COG-N-415 ATAC-Seq REP1
+GSM4104572	COG-N-415 ATAC-Seq REP2
+GSM4104573	COG-N-440 ATAC-Seq REP1
+GSM4104574	COG-N-440 ATAC-Seq REP2
+GSM4104575	COG-N-453 ATAC-Seq REP1
+GSM4104576	COG-N-453 ATAC-Seq REP2
+GSM4104577	KELLY ATAC-Seq REP1
+GSM4104578	KELLY ATAC-Seq REP2
+GSM4104579	LA-N-5 ATAC-Seq REP1
+GSM4104580	LA-N-5 ATAC-Seq REP2
+GSM4104581	NB-1 ATAC-Seq REP1
+GSM4104582	NB-1 ATAC-Seq REP2
+GSM4104583	NB-1643 ATAC-Seq REP1
+GSM4104584	NB-1643 ATAC-Seq REP2
+GSM4104585	NB-69 ATAC-Seq REP1
+GSM4104586	NB-69 ATAC-Seq REP2
+GSM4104587	NBL-S ATAC-Seq REP1
+GSM4104588	NBL-S ATAC-Seq REP2
+GSM4104589	NGP ATAC-Seq REP1
+GSM4104590	NGP ATAC-Seq REP2
+GSM4104591	SK-N-AS ATAC-Seq REP1
+GSM4104592	SK-N-AS ATAC-Seq REP2
+GSM4104593	SK-N-BE(2)-C ATAC-Seq REP1
+GSM4104594	SK-N-BE(2)-C ATAC-Seq REP2
+GSM4104595	SK-N-FI ATAC-Seq REP1
+GSM4104596	SK-N-FI ATAC-Seq REP2
+GSM4104597	SK-N-SH ATAC-Seq REP1
+GSM4104598	SK-N-SH ATAC-Seq REP2
+
+Data files:
+GSE138293_COGN415.macs2.dnase.broad.SPMR.sorted.bw 
+GSE138293_COGN440.macs2.dnase.broad.SPMR.sorted.bw 
+GSE138293_COGN453.macs2.dnase.broad.SPMR.sorted.bw 
+GSE138293_KELLY.macs2.dnase.broad.SPMR.sorted.bw 
+GSE138293_LAN5.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_NB1.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_NB1643.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_NB69.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_NBLS.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_NGP.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_SKNAS.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_SKNBE2C.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_SKNFI.macs2.dnase.broad.SPMR.sorted.bw
+GSE138293_SKNSH.macs2.dnase.broad.SPMR.sorted.bw
+
+Download and load data:
+
+```{r get_ext_data_3}
+curID <- "GSE138293"
+clNames <- c("COGN415", "COGN440", "COGN453", "KELLY", "LAN5", "NB1", "NB1643", "NB69", "NBLS", "NGP", "SKNAS", "SKNBE2C", "SKNFI", "SKNSH")
+allUrls <- paste0("https://ftp.ncbi.nlm.nih.gov/geo/series/GSE138nnn/GSE138293/suppl/GSE138293_", clNames, ".macs2.dnase.broad.SPMR.sorted.bw")
+ 
+# read in bigWig files:
+wigs <- lapply(allUrls, loadAndCacheWig)
+names(wigs) <- clNames
+
+forEach(wigs, function(x) print(head(x)))
+```
+Aggregate scores in external data by peaks:
+
+```{r prep_ext_data_3}
+# calculate the average `score` from the bigWig files within the peak regions:
+meanScores <- lapply(wigs, function(wig) {
+   as.data.table(peaksGrHg19 %>% group_by_overlaps(wig) %>% summarise(score = mean(score)))
+})
+
+# merge aggregated score from all input datasets:
+meanScoresDt <- rbindlist(meanScores, idcol = "cellline_name")
+
+# set region ID:
+meanScoresDt[, rid := peaksGrHg19$rid[query]]
+
+print(head(meanScoresDt))
+
+m <- dtToDf(dcast(meanScoresDt, rid ~ cellline_name, value.var="score"))
+print(head(m))
+```
+Run GSEA:
+
+```{r}
+m <- m[rowSums(m>0,na.rm=T)>0, ] # remove all-zero rows
+
+gseaRes[[curID]] <- doGSEA(m, peaksDtHg19)
+print(gseaRes[[curID]])
+
+print(ggplot(gseaRes[[curID]], aes(x=pathway, y=dataset)) + geom_point(aes(size=NES, shape=padj<=PADJ_THRESH), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,5)) + xlab(NULL) + ylab("NB cell line") + defTheme(flipX = TRUE))
+```
+
+
+## Dataset GSE224241 (hg19)
+
+Samples:
+
+Data files:
+File	GSM7018200_index40-IMR32-NTC-ATAC-rep1_S7_filtered_RPKM.bw	02/01/2023 10:05:40	186094657	BW
+File	GSM7018201_index22-CLBGA-NTC-ATAC-rep1_S11_filtered_RPKM.bw	02/01/2023 10:03:56	102114241	BW
+File	GSM7018202_SHEP_TAT_SOX11_G2_-DOX_48h_TR1_S3_filtered_RPKM.bw	02/01/2023 09:58:39	203261934	BW
+
+Download and load data:
+
+```{r get_ext_data_GSE224241}
+curID <- "GSE224241"
+
+# download external file and store it locally:
+GSE224241.f <- 
+  getExternalFile("GSE224241_RAW.tar",
+                  "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE224nnn/GSE224241/suppl/GSE224241_RAW.tar")
+
+# Untar BW files
+untar(tarfile = GSE224241.f, exdir = resultsDir("downloaded_files/"))
+
+clNames <- c("IMR32", "CLBGA", "SHEP")
+
+# read in bigWig files:
+wigs <- lapply(c(
+  resultsDir("downloaded_files/GSM7018200_index40-IMR32-NTC-ATAC-rep1_S7_filtered_RPKM.bw"),
+  resultsDir("downloaded_files/GSM7018201_index22-CLBGA-NTC-ATAC-rep1_S11_filtered_RPKM.bw"),
+  resultsDir("downloaded_files/GSM7018202_SHEP_TAT_SOX11_G2_-DOX_48h_TR1_S3_filtered_RPKM.bw")
+), loadAndCacheWig)
+
+# Chromosome names in NCBI format
+# Changing to UCSC style for consistency
+for(i in 1:length(wigs)) seqlevelsStyle(wigs[[i]]) <- "UCSC"
+
+names(wigs) <- clNames
+
+forEach(wigs, function(x) print(head(x)))
+```
+
+Aggregate scores in external data by peaks:
+
+```{r prep_ext_data_GSE224241}
+# calculate the average `score` from the bigWig files within the peak regions:
+meanScores <- lapply(wigs, function(wig) {
+   as.data.table(peaksGrHg19 %>% group_by_overlaps(wig) %>% summarise(score = mean(score)))
+})
+
+# merge aggregated score from all input datasets:
+meanScoresDt <- rbindlist(meanScores, idcol = "cellline_name")
+
+# set region ID:
+meanScoresDt[, rid := peaksGrHg19$rid[query]]
+
+print(head(meanScoresDt))
+
+m <- dtToDf(dcast(meanScoresDt, rid ~ cellline_name, value.var="score"))
+print(head(m))
+```
+
+Run GSEA:
+
+```{r gsea_GSE224241}
+m <- m[rowSums(m>0,na.rm=T)>0, ] # remove all-zero rows
+
+gseaRes[[curID]] <- doGSEA(m, peaksDtHg19)
+print(gseaRes[[curID]])
+
+print(ggplot(gseaRes[[curID]], aes(x=pathway, y=dataset)) + geom_point(aes(size=NES, shape=padj<=PADJ_THRESH), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,5)) + xlab(NULL) + ylab("NB cell line") + defTheme(flipX = TRUE))
+```
+
+
+
+
+## Dataset GSE136279 (hg19)
+
+Samples:
+GSM4043954	KELLY [ATAC-Seq]
+GSM4043955	SK-N-AS [ATAC-Seq]
+
+Data files:
+File	GSM4043954_KELLY_ATACseq.bw	11/30/2017 17:23:09	236647475	BW
+File	GSM4043954_KELLY_ATACseq_peaks.narrowPeak.gz	08/23/2019 15:32:13	2471539	NARROWPEAK
+File	GSM4043955_SK-N-AS_ATACseq.bw	11/16/2017 12:51:56	143531135	BW
+File	GSM4043955_SK-N-AS_ATACseq_peaks.narrowPeak.gz	08/23/2019 15:32:14	1391816	NARROWPEAK
+
+Download and load data:
+
+```{r get_ext_data_GSE136279}
+curID <- "GSE136279"
+
+# download external file and store it locally:
+GSE136279.f <- 
+  getExternalFile("GSE136279_RAW.tar",
+                  "https://ftp.ncbi.nlm.nih.gov/geo/series/GSE136nnn/GSE136279/suppl/GSE136279_RAW.tar")
+
+# Untar BW files
+untar(tarfile = resultsDir("downloaded_files/GSE136279_RAW.tar"),
+      exdir = resultsDir("downloaded_files/"))
+
+
+clNames <- c("KELLY", "SKNAS")
+
+# read in bigWig files:
+wigs <- lapply(c(
+  resultsDir("downloaded_files/GSM4043954_KELLY_ATACseq.bw"),
+  resultsDir("downloaded_files/GSM4043955_SK-N-AS_ATACseq.bw")
+), loadAndCacheWig)
+names(wigs) <- clNames
+
+forEach(wigs, function(x) print(head(x)))
+```
+
+Aggregate scores in external data by peaks:
+
+```{r prep_ext_data_GSE136279}
+# calculate the average `score` from the bigWig files within the peak regions:
+meanScores <- lapply(wigs, function(wig) {
+   as.data.table(peaksGrHg19 %>% group_by_overlaps(wig) %>% summarise(score = mean(score)))
+})
+
+# merge aggregated score from all input datasets:
+meanScoresDt <- rbindlist(meanScores, idcol = "cellline_name")
+
+# set region ID:
+meanScoresDt[, rid := peaksGrHg19$rid[query]]
+
+print(head(meanScoresDt))
+
+m <- dtToDf(dcast(meanScoresDt, rid ~ cellline_name, value.var="score"))
+print(head(m))
+```
+
+Run GSEA:
+
+```{r gsea_GSE136279}
+m <- m[rowSums(m>0,na.rm=T)>0, ] # remove all-zero rows
+
+gseaRes[[curID]] <- doGSEA(m, peaksDtHg19)
+print(gseaRes[[curID]])
+
+print(ggplot(gseaRes[[curID]], aes(x=pathway, y=dataset)) + geom_point(aes(size=NES, shape=padj<=PADJ_THRESH), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,5)) + xlab(NULL) + ylab("NB cell line") + defTheme(flipX = TRUE))
+```
+
+
+
+
+
+## Dataset GSE202511 -- control (hg38)
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE202511
+
+Download and load files:
+
+```{r get_ext_data_GSE202511}
+curID <- "GSE202511"
+allUrls <- c(
+  "AU-565"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123337/suppl/GSM6123337%5Fatacseq%5FAU%2D565%5F1%5FR1.bigwig",
+  "BT-474"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123338/suppl/GSM6123338%5Fatacseq%5FBT%2D474%5F1%5FR1.bigwig",
+  "MCF7"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123339/suppl/GSM6123339%5Fatacseq%5FMCF7%5F1%5FR1.bigwig",
+  "MDA-MB-231"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123340/suppl/GSM6123340%5Fatacseq%5FMDA%2DMB%2D231%5F1%5FR1.bigwig",
+  "MDA-MB-361"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123341/suppl/GSM6123341%5Fatacseq%5FMDA%2DMB%2D361%5F1%5FR1.bigwig",
+  "SK-BR-3"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123342/suppl/GSM6123342%5Fatacseq%5FSK%2DBR%2D3%5F1%5FR1.bigwig",
+  "T-47D"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123343/suppl/GSM6123343%5Fatacseq%5FT%2D47D%5F1%5FR1.bigwig",
+  "ZR-75-1"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM6123nnn/GSM6123344/suppl/GSM6123344%5Fatacseq%5FZR%2D75%2D1%5F1%5FR1.bigwig"
+)
+clNames <- names(allUrls)
+ 
+# read in bigWig files:
+wigs <- lapply(allUrls, loadAndCacheWig)
+names(wigs) <- clNames
+
+forEach(wigs, function(x) print(head(x)))
+```
+
+Aggregate scores in external data by peaks:
+
+```{r prep_ext_data_GSE202511}
+# calculate the average `score` from the bigWig files within the peak regions:
+meanScores <- lapply(wigs, function(wig) {
+   as.data.table(peaksGr %>% group_by_overlaps(wig) %>% summarise(score = mean(score)))
+})
+
+# merge aggregated score from all input datasets:
+meanScoresDt <- rbindlist(meanScores, idcol = "cellline_name")
+
+# set region ID:
+meanScoresDt[, rid := peaksGr$rid[query]]
+
+print(head(meanScoresDt))
+
+m <- dtToDf(dcast(meanScoresDt, rid ~ cellline_name, value.var="score"))
+print(head(m))
+```
+
+Run GSEA:
+
+```{r gsea_GSE202511}
+m <- m[rowSums(m>0,na.rm=T)>0, ] # remove all-zero rows
+
+gseaRes[[curID]] <- doGSEA(m, peaksDt)
+print(gseaRes[[curID]])
+
+print(ggplot(gseaRes[[curID]], aes(x=pathway, y=dataset)) + geom_point(aes(size=NES, shape=padj<=PADJ_THRESH), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,5)) + xlab(NULL) + ylab("Cell line") + defTheme(flipX = TRUE))
+```
+
+
+## Dataset GSE228832 -- control (hg19)
+
+https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE228832
+
+Download and load files:
+
+```{r get_ext_data_GSE228832}
+curID <- "GSE228832"
+allUrls <- c(
+  "ASJ01_R1"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM7139nnn/GSM7139779/suppl/GSM7139779%5FASJ01%5FR1.mLb.clN.bigWig",
+  "ASJ02_R1"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM7139nnn/GSM7139780/suppl/GSM7139780%5FASJ02%5FR1.mLb.clN.bigWig",
+  "NCIH460_22_R1"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM7139nnn/GSM7139781/suppl/GSM7139781%5FNCIH460%5F22%5FR1.mLb.clN.bigWig",
+  "NCIH460_23_R1"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM7139nnn/GSM7139782/suppl/GSM7139782%5FNCIH460%5F23%5FR1.mLb.clN.bigWig",
+  "NCIH460_24_R1"="https://ftp.ncbi.nlm.nih.gov/geo/samples/GSM7139nnn/GSM7139783/suppl/GSM7139783%5FNCIH460%5F24%5FR1.mLb.clN.bigWig"
+)
+clNames <- names(allUrls)
+ 
+# read in bigWig files:
+wigs <- lapply(allUrls, loadAndCacheWig)
+names(wigs) <- clNames
+
+# Chromosome names in NCBI format
+# Changing to UCSC style for consistency
+for(i in 1:length(wigs)) seqlevelsStyle(wigs[[i]]) <- "UCSC"
+
+forEach(wigs, function(x) print(head(x)))
+```
+
+Aggregate scores in external data by peaks:
+
+```{r prep_ext_data_GSE228832}
+# calculate the average `score` from the bigWig files within the peak regions:
+meanScores <- lapply(wigs, function(wig) {
+   as.data.table(peaksGrHg19 %>% group_by_overlaps(wig) %>% summarise(score = mean(score)))
+})
+
+# merge aggregated score from all input datasets:
+meanScoresDt <- rbindlist(meanScores, idcol = "cellline_name")
+
+# set region ID:
+meanScoresDt[, rid := peaksGrHg19$rid[query]]
+
+print(head(meanScoresDt))
+
+m <- dtToDf(dcast(meanScoresDt, rid ~ cellline_name, value.var="score"))
+print(head(m))
+```
+
+Run GSEA:
+
+```{r gsea_GSE228832}
+m <- m[rowSums(m>0,na.rm=T)>0, ] # remove all-zero rows
+
+gseaRes[[curID]] <- doGSEA(m, peaksDtHg19)
+print(gseaRes[[curID]])
+
+print(ggplot(gseaRes[[curID]], aes(x=pathway, y=dataset)) + geom_point(aes(size=NES, shape=padj<=PADJ_THRESH), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,5)) + xlab(NULL) + ylab("Cell line") + defTheme(flipX = TRUE))
+```
+
+
+## EpiMap -- control (hg19)
+
+Download and load data:
+
+```{r get_ext_data_EpiMap}
+curID <- "EpiMap"
+clNames <- c(
+  #paste0("imputed_", c("Adipose", "Brain", "ESC", "Neurosph", "Stromal")), #"Bone", "Brain", "Epithelial", "Kidney", "Liver", "Muscle", Pancreas", , "Urinary"
+  paste0("observed_", c("Adipose", "Brain", "Cancer", "Digestive", "Endocrine", "Epithelial", "Heart", "Liver", "Muscle", "Other", "PNS", "Pancreas", "Reproductive", "Spleen"))
+)
+allUrls <- paste0("https://epigenome.wustl.edu/epimap/data/averagetracks_pergroup/average_ATAC-seq_", clNames, ".bigWig")
+  
+  
+  
+# read in bigWig files:
+wigs <- lapply(allUrls, loadAndCacheWig)
+names(wigs) <- clNames
+
+# Chromosome names in NCBI format
+# Changing to UCSC style for consistency
+for(i in 1:length(wigs)) seqlevelsStyle(wigs[[i]]) <- "UCSC"
+
+forEach(wigs, function(x) print(head(x)))
+```
+
+Aggregate scores in external data by peaks:
+
+```{r prep_ext_data_EpiMap}
+# calculate the average `score` from the bigWig files within the peak regions:
+meanScores <- lapply(wigs, function(wig) {
+   as.data.table(peaksGrHg19 %>% group_by_overlaps(wig) %>% summarise(score = mean(score)))
+})
+
+# merge aggregated score from all input datasets:
+meanScoresDt <- rbindlist(meanScores, idcol = "cellline_name")
+
+# set region ID:
+meanScoresDt[, rid := peaksGrHg19$rid[query]]
+
+print(head(meanScoresDt))
+
+m <- dtToDf(dcast(meanScoresDt, rid ~ cellline_name, value.var="score"))
+print(head(m))
+```
+
+Run GSEA:
+
+```{r gsea_EpiMap}
+m <- m[rowSums(m>0,na.rm=T)>0, ] # remove all-zero rows
+
+gseaRes[[curID]] <- doGSEA(m, peaksDtHg19)
+print(gseaRes[[curID]])
+
+print(ggplot(gseaRes[[curID]], aes(x=pathway, y=dataset)) + geom_point(aes(size=NES, shape=padj<=PADJ_THRESH), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,5)) + xlab(NULL) + ylab("NB cell line") + defTheme(flipX = TRUE))
+```
+
+
+## Merge and plot
+
+Combine the GSEA results from all datasets:
+
+```{r merge_data}
+pData <- rbindlist(gseaRes, idcol="data_source", fill=TRUE)
+pData[, cellline_name:= gsub("_ATAC", "", gsub("_.MYC", "", gsub("_[Kk]\\d.+$", "", gsub("_rep\\d+", "", dataset, ignore.case=TRUE))))]
+```
+
+Add curated annotations for neuroblastoma cell lines:
+
+```{r}
+pDataX <- merge(pData, fread(metaDir("nb_celllines.csv")), all.x=TRUE, by="cellline_name")
+print(head(pDataX))
+```
+
+Plot (Supplementary Fig. 12g):
+
+```{r, fig.width=14, fig.height=6}
+maxA <- 8
+alphaBy <- "mlogp"
+PADJ_THRESH <- 0.05
+
+pDataX[, mlogp:=-log10(pval)]
+
+stylePlot <- function(p) {
+  p + geom_point(aes(size=NES), fill="#333333") + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + scale_size_continuous(range=c(0.001,6)) + xlab(NULL) + ylab("NB cell line") + defTheme(flipX = TRUE)
+}
+
+p <- stylePlot(ggplot(pDataX, aes(y=factor(pathway, levels=paste0("R",9:1)), x=dataset, alpha=pmin(get(alphaBy), maxA))) + facet_grid(.~data_source, space = "free_x", scales="free_x")) 
+
+print(p)
+
+ggsave(filename = figuresDir("figure_atac_comparisons.pdf"), plot = p, width = 14, height = 7, dpi = 600, unit = "in")
+fwrite(pDataX[, .(data_source, dataset, pathway, pval, padj, log2err, ES, NES, size)], file = figuresDir("figure_atac_comparisons_data.csv"))
+```
+
+
+
+
+# TF targets in TARGET/SEQC
+
+```{r}
+col2names= function(dff, coll){
+rownames(dff)= dff[, coll]
+dff
+}
+
+givecolnames=function(x, ind=NULL, nms){
+  if (is.null(ind)){
+   ind= 1:length(nms) 
+  }
+ colnames(x)[ind]= nms
+ x
+  
+}
+ 
+giverownames=function(x, nms){
+ rownames(x)= nms
+ x
+  
+}
+names2col=function(dff, coln="gene") {
+dff[, coln]= rownames(dff) 
+dff
+}
+```
+
+## TARGET
+
+Import target dataset (gdc)
+
+Load TARGET data (manual)
+
+```{r}
+target.data.path=file.path(config$out_root, "input_data/bulkrna_patients/target/")
+metadata.target= fread(file.path(config$out_root, "input_data/bulkrna_patients/target_metadata/20231127_TARGET_clinical_data_merged.csv")) %>% as.data.frame %>% col2names(., "File.ID") %>% mutate(sample.id=File.ID)
+
+allfiles.intable=metadata.target %>% rownames
+
+allfiles.indirectory=list.files(target.data.path)
+
+allfiles.indirectory= allfiles.indirectory[!grepl("MANIFEST", allfiles.indirectory)]
+
+##  files shared between both metadata and files
+shared.files=intersect(allfiles.intable, allfiles.indirectory)
+
+
+count.column="unstranded"
+alltablist=lapply(shared.files, function(ptfile){
+ 
+pt.target.counts=list.files(file.path(target.data.path, ptfile), pattern="*augmented_star_gene_counts.tsv")   
+
+table.header=fread(file.path(target.data.path, ptfile, pt.target.counts), nrow=2) %>% colnames 
+table.main0=fread(file.path(target.data.path, ptfile, pt.target.counts), skip=6) %>% as.data.frame  
+## remove duplicated entries and get the right column
+table.main=table.main0[!(table.main0$V2 %>% duplicated),] %>% col2names(., "V2")
+
+colnames(table.main)=table.header
+
+table.main=table.main %>% select(!!sym(count.column)) %>% givecolnames(., 1, ptfile)
+table.main
+}) 
+
+counts.target = alltablist %>% Reduce(cbind, .)
+synonym.h2afj=c( "H2AJ", "FLJ10903","MGC921")[c( "H2AJ", "FLJ10903","MGC921") %in% rownames(counts.target)]
+rownames(counts.target)[rownames(counts.target)==synonym.h2afj]="H2AFJ"
+```
+
+FILTER PATIENTS FOR USE DURING ANALYSIS
+
+```{r}
+format.status=Vectorize(function(x) {
+  if(!is.na(x)){if(x=="Alive" || x=="0"){0}else{
+  if(x=="Dead" || x=="1"){1}}}else{NA}
+  }, USE.NAMES=F)
+
+edit.stage23= Vectorize(function(st){
+ if(grepl("Stage 2", st, ignore.case=T) | grepl("Stage 3", st, ignore.case=T)){
+  return("Stage 2-3") 
+ }else{
+   if(grepl("Stage 4s", st, ignore.case=T)){
+   return("Stage 4s")
+     }else{
+return(st)}}}, USE.NAMES=F) 
+
+edit.event.target=Vectorize(function(ev){
+  if(ev=="Censored"){
+    return(0)
+  }else{return(1)
+ }},USE.NAMES=F)
+
+edit.event.target.2=Vectorize(function(efstime, ostime, firstevent){
+  ##Conditions for 1: 
+  #a) if first event is death and efstime == ostime
+  #b) if first event is not death and if efstime is shorter than ostime 
+
+  if((firstevent=="Death" & efstime==ostime)  || (firstevent!="Death" & efstime < ostime)){
+  return(1)}else{
+    return(0)
+} }, USE.NAMES=F)
+  
+mt=metadata.target %>% filter(primary_diagnosis=="Neuroblastoma, NOS") %>% mutate(Event_Free_Survival=edit.event.target.2(Event_Free_Survival_Time_in_Days, Overall_Survival_Time_in_Days, First_Event), inss_stage=edit.stage23(inss_stage))
+
+
+mt$EFS_days <- (mt$Event_Free_Survival_Time_in_Days)
+mt$OS_days <- (mt$Overall_Survival_Time_in_Days)
+```
+
+TARGET Preliminary analysis: load DEseq object, estimate size factors and obtain VST for count matrix.
+
+```{r}
+library(DESeq2)
+dds.target <- DESeq(DESeqDataSetFromMatrix(counts.target[, rownames(mt)], colData= mt, design = ~1))
+vsd.target=assay(vst(dds.target))
+```
+
+
+
+## SEQC
+
+load seqc dataset
+
+```{r loadseqc}
+format.seqc.entry=function(x) if(grepl(":", x)){strsplit(x, split="\\: ")[[1]][2]}else{x} 
+get.seqc.field=function(x) if(grepl(":", x)){strsplit(x, split="\\: ")[[1]][1]}else{x} 
+clean.name=Vectorize(function(x) {
+  first.split=strsplit(x, split=" \\[")[[1]][1]
+  
+  if(grepl("SEQC", first.split) ){
+  strsplit(first.split, split="SEQC_")[[1]][2]}else{first.split}}, USE.NAMES=F)
+
+remove.first.row=function(df)
+  df[2:nrow(df), ]
+remove.last.row=function(df)
+  df[1:(nrow(df)-1), ]
+
+
+## import clinical covariates from bioprotocols publication https://bio-protocol.org/exchange/minidetail?type=30&id=9552520
+
+##seqc counts
+
+counts.seqc0=fread(file.path(config$out_root, "input_data/bulkrna_patients/seqc/GSE49711_SEQC_NB_MAV_G_log2.20121127.txt")) %>% as.data.frame
+
+counts.seqc=counts.seqc0[,c(1, 10:(ncol(counts.seqc0)))] 
+newnames=clean.name(colnames(counts.seqc))
+newnames[1]="gene"             
+counts.seqc=  counts.seqc %>% givecolnames(., nms=newnames) 
+counts.seqc=(counts.seqc[!duplicated(counts.seqc[, "gene"]), ] %>% col2names(., "gene"))[, 2:ncol(counts.seqc)]
+```
+
+incorporate relevant gene synonyms
+
+```{r}
+synonym.ppp1r17=c("GSBS", "C7orf16", "PPP1R17")[c("GSBS", "C7orf16", "PPP1R17") %in% rownames(counts.seqc)]
+synonym.LINC=c("NONHSAG037830.2", "HSALNG0034072", "LINC00682")[c("NONHSAG037830.2", "HSALNG0034072", "LINC00682") %in% rownames(counts.seqc)] 
+synonym.rbfox1= c("HRNBP1","A2BP1","FOX-1","A2BP","2BP1")[ c("HRNBP1","A2BP1","FOX-1","A2BP","2BP1") %in% rownames(counts.seqc)] 
+synonym.cavin1=c("CGL4","PTRF","FKSG13","CAVIN")[c("CGL4","PTRF","FKSG13","CAVIN") %in% rownames(counts.seqc)] 
+synonym.cytor= c("C2orf59","C2ORF59" ,"NCRNA00152","LINC00152","MGC4677" )[c("C2orf59","C2ORF59" ,"NCRNA00152","LINC00152","MGC4677" ) %in% rownames(counts.seqc)] 
+synonym.eva1b=c("FLJ10647","C1orf78","C1ORF78","FAM176B")[c("FLJ10647","C1orf78","C1ORF78","FAM176B") %in% rownames(counts.seqc)] 
+synonym.mir=c("LINC00978","MORRBID","AGD2","AK001796","LncRNA-AWPPH","MIR4435-1HG","NONHSAG028949.2","NONHSAG028940.2","HSALNG0017865","LNCRNA-AWPPH","Lnc-ANAPC1-4"
+,"Lnc-ANAPC1-7"
+,"MIR4435-2HG")[c("LINC00978","MORRBID","AGD2","AK001796","LncRNA-AWPPH","MIR4435-1HG","NONHSAG028949.2","NONHSAG028940.2","HSALNG0017865","LNCRNA-AWPPH","Lnc-ANAPC1-4"
+,"Lnc-ANAPC1-7"
+,"MIR4435-2HG") %in% rownames(counts.seqc)] 
+
+
+rownames(counts.seqc)[rownames(counts.seqc)==synonym.ppp1r17]="PPP1R17"
+rownames(counts.seqc)[rownames(counts.seqc)==synonym.rbfox1]="RBFOX1"
+rownames(counts.seqc)[rownames(counts.seqc)==synonym.cavin1]="CAVIN1"
+rownames(counts.seqc)[rownames(counts.seqc)==synonym.cytor]="CYTOR"
+rownames(counts.seqc)[rownames(counts.seqc)==synonym.eva1b]="EVA1B"
+```
+
+```{r}
+metadata.seqc.original0=((fread(file.path(config$out_root, "input_data/bulkrna_patients/seqc/GSE49711_series_matrix.txt"), skip=65, fill=T, header=F) %>% t) %>% as.data.frame %>% mutate(V1=clean.name(V1))) %>% col2names(., "V1") 
+metacols=make.names(metadata.seqc.original0[1,])
+metadata.seqc.original= metadata.seqc.original0 %>% remove.first.row
+
+seqc.fields= (metadata.seqc.original %>% apply(., c(1,2), get.seqc.field))[1,] %>% as.character
+
+
+metadata.seqc.original=metadata.seqc.original %>% apply(., c(1,2), format.seqc.entry) 
+
+metacols2=metacols
+metacols2[metacols=="X.Sample_characteristics_ch1"]=seqc.fields[metacols=="X.Sample_characteristics_ch1"] %>% make.names
+colnames(metadata.seqc.original)=metacols2
+## getting rid of extra duplicated columns from protocol etc
+metadata.seqc.original=metadata.seqc.original[,!duplicated(metacols2)]
+metadata.seqc.original=metadata.seqc.original %>% as.data.frame %>% names2col(., "sample.id") %>% mutate( high.risk.original=high.risk, inss_stage=inss.stage, MYCN_status=mycn.status) 
+```
+
+```{r}
+seqc.clinical=fread(file.path(config$out_root, "input_data/bulkrna_patients/seqc/clinicalvars.csv")) %>% as.data.frame %>% mutate(NB.ID=get("Patient ID")) %>% col2names(., coll="NB.ID")
+
+#import metadata with survival from seqc
+theader0=(fread(file.path(config$out_root, "input_data/bulkrna_patients/seqc/GSE62564_series_matrix.txt"), skip=50, header=F, fill=T) %>% t)[1, ] %>% make.names
+
+##metadata.table.2
+seqc=(fread(file.path(config$out_root, "input_data/bulkrna_patients/seqc/GSE62564_series_matrix.txt"), skip=50, fill=T)[, 2:499] %>% t) 
+seqc.formatted=seqc %>% apply(., c(1,2), format.seqc.entry) 
+seqc.fields2= (seqc %>% apply(., c(1,2), get.seqc.field))[1,] %>% as.character
+theader=theader0[2:length(theader0)]
+theader2=theader
+theader2[theader=="X.Sample_characteristics_ch1"]=seqc.fields2[theader=="X.Sample_characteristics_ch1"]
+seqc.formatted=as.data.frame(seqc.formatted)
+colnames(seqc.formatted)=theader2 %>% make.names 
+rownames(seqc.formatted)= clean.name(rownames(seqc.formatted))
+metadata.seqc.2=seqc.formatted %>% names2col(., coln="NB.ID") %>% mutate(Overall_Survival_Time_in_Days=os.day, Event_Free_Survival_Time_in_Days=efs.day) %>% left_join(., seqc.clinical,  by="NB.ID") %>% mutate(MYCN_status=get("MYCN status"), inss_stage=get("INSS Stage"), days_to_birth=-Age, sample.id=NB.ID) %>% col2names(., "sample.id")
+```
+
+
+merge both metadata tables
+
+```{r}
+mtso.reduced=metadata.seqc.original[, c("sample.id", "dataset", "age.at.diagnosis", "mycn.status", 
+"inss.stage", "class.label", "progression", "death.from.disease", 
+"high.risk.original", "MYCN_status")]
+
+mts2.reduced=metadata.seqc.2[, c("sample.id", "training.validation", "age", "efs.day", "efs.bin", "os.day", 
+"os.bin", "a_efs_all", "b_os_all", "c_sex_all", "d_fav_all", 
+"e_efs_hr", "f_os_hr", "Overall_Survival_Time_in_Days", 
+"Event_Free_Survival_Time_in_Days", "Patient ID", "Country", 
+"inss_stage", "Age", "HighRisk", "Sex_Imputed", 
+"OS_bin", "days_to_birth")]
+
+
+metadata.seqc.full=mtso.reduced %>% as.data.frame %>% left_join(.,
+mts2.reduced , by="sample.id") %>% mutate(inss_stage=paste0("Stage ",inss_stage))%>% mutate(inss_stage=edit.stage23(inss_stage), high.risk=high.risk.original, Vital_Status=format.status(death.from.disease), Event_Free_Survival=format.status(efs.bin)
+                                                                                            ) %>% col2names(., "sample.id")
+
+metadata.seqc.full$age_at_index <- (as.numeric(metadata.seqc.full$age.at.diagnosis) / 365)
+metadata.seqc.full$gender <- ifelse(metadata.seqc.full$Sex_Imputed=="F", "female", "male")
+metadata.seqc.full$MYCN_status <- "Unknown"
+metadata.seqc.full$MYCN_status[metadata.seqc.full$mycn.status=="1"] <- "Amplified"
+metadata.seqc.full$MYCN_status[metadata.seqc.full$mycn.status=="0"] <- "Not Amplified"
+
+metadata.seqc.full$EFS_days <- (as.numeric(metadata.seqc.full$Event_Free_Survival_Time_in_Days))
+metadata.seqc.full$OS_days <- (as.numeric(metadata.seqc.full$Overall_Survival_Time_in_Days))
+```
+
+```{r}
+print(head(metadata.seqc.full)) 
+```
+
+
+handling data via DESeq2 but not normalising as the data has been already processed in seveal ways
+
+```{r}
+dds.seqc <- DESeqDataSetFromMatrix(apply(counts.seqc[, rownames(metadata.seqc.full)], c(1,2), function(x) (2**x) %>% as.integer), colData= metadata.seqc.full, design = ~1)
+vsd.seqc=assay(vst(dds.seqc))
+```
+
+
+
+## CCRI
+
+```{r}
+
+metadata.stm.mycn=fread(file.path(config$out_root, "input_data/bulkrna_patients/stm/metadata_MYCN.csv"))
+metadata.stm.nonmycn=fread(file.path(config$out_root, "input_data/bulkrna_patients/stm/metadata_nonMYCN.csv"))      
+metadata.stm.clinical=fread(file.path(config$out_root, "input_data/bulkrna_patients/stm/stm_clinical_eb_up_v2.csv"), skip=1)  %>% as.data.frame
+
+
+all.cols=union(colnames(metadata.stm.mycn), colnames(metadata.stm.nonmycn))
+shared.cols=intersect(colnames(metadata.stm.mycn), colnames(metadata.stm.nonmycn))
+
+metadata.stm.full=rbind(metadata.stm.mycn %>% dplyr::select(all_of(shared.cols)), metadata.stm.nonmycn %>% dplyr::select(all_of(shared.cols))) %>% as.data.frame
+
+edit.mycn=Vectorize(function(x) if(x=="YES"){return("Amplified")}else{return("Not Amplified")}, USE.NAMES=F)
+edit.stage=Vectorize(function(x) if(is.na(x) || x==""){return(NA)}else{return(paste0("Stage ", x))}, USE.NAMES=F)
+edit.17q=Vectorize(function(x){
+  if(!is.na(x)){
+  if(x=="YES"|| x=="yes"){return("yes")}else{return("no")}}else{return(NA)}}, USE.NAMES=F)
+
+metadata.stm.full.clinical=metadata.stm.full %>% col2names(., "omics_id") %>% mutate(MYCN_status=edit.mycn(mna),
+x17q_gain=edit.17q(x17q_gain),                                                                                     inss_stage=edit.stage23(edit.stage(metadata.stm.clinical[metadata.stm.full %>% rownames, "INSSStadium" ])),
+                                                                                      Event_Free_Survival_Time_in_Days=metadata.stm.clinical[metadata.stm.full %>% rownames, "EFS_dur" ] ,
+                                                                                     time_to_death= metadata.stm.clinical[metadata.stm.full %>% rownames, "tod_dur" ] , Event_Free_Survival=metadata.stm.clinical[metadata.stm.full %>% rownames, "EFS" ], 
+
+#Vital_Status=metadata.stm.clinical[metadata.stm.full %>% rownames, "Tod" ],
+Vital_Status=metadata.stm.clinical[metadata.stm.full %>% rownames, "EFS" ],                                                                                     age=metadata.stm.clinical[metadata.stm.full %>% rownames, "age_in_months" ],
+                                                                                     date_of_birth=metadata.stm.clinical[metadata.stm.full %>% rownames, "GEBDAT" ]
+
+,date_of_diagnosis=metadata.stm.clinical[metadata.stm.full %>% rownames, "DXDAT" ],
+date_of_death=metadata.stm.clinical[metadata.stm.full %>% rownames, "death_date" ],
+Event_type=metadata.stm.clinical[metadata.stm.full %>% rownames, "Event_type" ],
+MYCN_status2=metadata.stm.clinical[metadata.stm.full %>% rownames, "NMCY" ])
+```
+
+```{r}
+counts.stm=fread(file.path(config$out_root, "input_data/bulkrna_patients/stm/full_omics_expression_data_normalized_counts.csv")) %>% as.data.frame
+counts.d.stm=counts.stm[!duplicated(counts.stm %>% pull(gene_name)), ] %>% col2names(., "gene_name")
+stm.intersect=intersect(as.data.frame(counts.stm) %>% colnames, metadata.stm.full %>% pull(omics_id))
+counts.stm.ready=counts.d.stm %>% select(all_of(stm.intersect))
+
+
+dds.stm=readRDS(file.path(config$out_root, "input_data/bulkrna_patients/stm/full_omics_dds.rds"))
+
+#has no appropriate gene names
+counts.stm.dds.raw=assay(dds.stm)
+```
+
+```{r}
+dnms=rowData(dds.stm) %>% as.data.frame %>% pull(gene_name) 
+
+counts.stm.dds.formatted=counts.stm.dds.raw[!duplicated(dnms), ] %>% giverownames(., dnms[!duplicated(dnms)])
+
+stm.intersect.dds=intersect(as.data.frame(counts.stm.dds.formatted) %>% colnames, metadata.stm.full.clinical %>% pull(omics_id))
+
+counts.stm.dds.ready=counts.stm.dds.formatted[, stm.intersect.dds]
+
+synonym.h2afj=c( "H2AJ", "FLJ10903","MGC921")[c( "H2AJ", "FLJ10903","MGC921") %in% rownames(counts.stm.dds.ready)]
+rownames(counts.stm.dds.ready)[rownames(counts.stm.dds.ready)==synonym.h2afj]="H2AFJ"
+```
+
+```{r}
+mtc=metadata.stm.full.clinical[ stm.intersect.dds,] %>% filter(tp=="DE")
+
+### complement metadata with the columns in the bicu metadata
+additional.columns=setdiff(colData(dds.stm) %>% as.data.frame %>% colnames, colnames(mtc))
+
+mtc.complete= cbind(mtc, (colData(dds.stm) %>% as.data.frame)[rownames(mtc), additional.columns ])
+```
+
+```{r}
+mtc.complete$age_at_index <- (as.numeric(mtc.complete$age_at_dx_months) / 12)
+mtc.complete$gender <- ifelse(mtc.complete$gender=="F" | mtc.complete$gender=="female", "female", "male")
+
+mtc.complete$EFS_days <- mtc.complete$Event_Free_Survival_Time_in_Days
+mtc.complete$OS_days <-  mtc.complete$time_to_death*30
+
+print(head(mtc.complete))
+```
+
+```{r}
+dds.ccri <- DESeq(DESeqDataSetFromMatrix(counts.stm.dds.ready[, rownames(mtc.complete)], colData=mtc.complete , design=~1))
+vsd.ccri=assay(vst(dds.ccri), normalised=T)
+```
+
+
+```{r}
+fwrite(as.data.table(vsd.target, keep.rownames=T), file=resultsDir("vsd.target.csv.gz"))
+fwrite(as.data.table(vsd.seqc, keep.rownames=T), file=resultsDir("vsd.seqc.csv.gz"))
+fwrite(as.data.table(vsd.ccri, keep.rownames=T), file=resultsDir("vsd.ccri.csv.gz"))
+fwrite(mt, file=resultsDir("mt.target.csv.gz"))
+fwrite(metadata.seqc.full, file=resultsDir("mt.seqc.csv.gz"))
+fwrite(mtc.complete, file=resultsDir("mt.ccri.csv.gz"))
+```
+
+
+
+## Plotting
+
+```{r}
+d.target <- as.matrix(dtToDf(fread(resultsDir("vsd.target.csv.gz"))))
+d.seqc <- as.matrix(dtToDf(fread(resultsDir("vsd.seqc.csv.gz"))))
+d.ccri <- as.matrix(dtToDf(fread(resultsDir("vsd.ccri.csv.gz"))))
+
+mt.target <- fread(resultsDir("mt.target.csv.gz"))
+setkey(mt.target, "sample.id")
+mt.seqc <- fread(resultsDir("mt.seqc.csv.gz"))
+setkey(mt.seqc, "sample.id")
+mt.ccri <- fread(resultsDir("mt.ccri.csv.gz"))
+setkey(mt.ccri, "omics_id")
+```
+
+### Plot TF gene expression
+
+Define colors and TFs of interest:
+
+```{r}
+annotCols <- list(
+  gender = c("female"="orange", "male"="steelblue"),
+  MYCN_status = c("Amplified"="#ff0000", "Not Amplified"="#0000ff", "Unknown"="#7f7f7f"),
+  inss_stage = c("Stage 1"="#fbb4ae", "Stage 2-3"="#b3cde3", "Stage 4"="#ccebc5", "Stage 4s"="#decbe4", "NA"="#7f7f7f", "Stage multilok. (2)"="pink")
+)
+
+grnGenes <- as.data.table(melt(list(
+	down_cna=c("NEUROD1", "ONECUT1", "ONECUT3", "ISL1", "INSM1", "NHLH1"),  # "act_ASCL1", "act_POU4F1","act_SIX1", "act_PHOX2B"
+	down_mycn=c("TFAP2B", "NR2F1", "SOX10",  "SOX5", "HOXB7", "PAX3"),  #,"act_KLF12",  "SOX4"
+	up_cna=c("HOXB3", "HOXD3", "CDX1", "CDX2", "FOXB1", "RFX4"), #, "act_FOS" "act_GLI2", "act_GATA6", 
+	up_mycn=c("MYCN", "ZIC2", "NR1D1", "TFAP4", "SOX2", "LEF1")
+), value.name = "gene_symbol", variable.name = "grn_module"))
+
+```
+Plot heatmaps (for Supplementary Fig. 14a):
+
+```{r, fig.width=18, fig.height=6}
+hmFun <- function(x, meta, n, grn_genes, annot_cols=annotCols) {
+  grn_genes <- grn_genes[grn_genes$gene_symbol%in%rownames(x),]
+  hm_data <- abscap(x[grn_genes$gene_symbol,])
+  hm_annot <- meta[colnames(x), names(annot_cols), with=F]
+  list(
+    plot=ComplexHeatmap::pheatmap(hm_data, border_color=NA, show_colnames = FALSE, annotation_col = hm_annot, annotation_colors = annot_cols, cellheight = 9, row_split=grn_genes$L1, color = viridisLite::viridis(9), cellwidth=1, main = n, use_raster = TRUE),
+    data=rbind(study=rep(n, ncol(hm_data)), t(hm_annot),round(hm_data,2))
+  )
+}
+
+grnGenesX <- grnGenes[gene_symbol%in%rownames(d.target) & gene_symbol%in%rownames(d.seqc) & gene_symbol%in%rownames(d.ccri), ]
+ 
+hmTARGET <- hmFun(d.target, mt.target, "TARGET", grn_genes=grnGenesX)
+hmSEQC <- hmFun(d.seqc, mt.seqc, "SEQC", grn_genes=grnGenesX) 
+hmCCRI <- hmFun(d.ccri, mt.ccri, "CCRI", grn_genes=grnGenesX) 
+ 
+ComplexHeatmap::draw(hmSEQC$plot + hmTARGET$plot + hmCCRI$plot)
+
+pdf(file = resultsDir("../figures/figure_atac_heatmap_nbbulk_tfexpr.pdf"), width=16, height=12)
+ComplexHeatmap::draw(hmSEQC$plot + hmTARGET$plot + hmCCRI$plot)
+dev.off()
+
+
+tmp <- data.table(hmTARGET$data, hmSEQC$data, hmCCRI$data, keep.rownames=TRUE)
+setnames(tmp, as.character(1:ncol(tmp)))
+fwrite(tmp, file=resultsDir("../figures/figure_atac_heatmap_nbbulk_tfexpr_data.csv"))
+```
+
+### Plot TF target gene expression
+
+Load TF target gene lists:
+
+```{r}
+tfTargets <- fread(resultsDir("tbl_tftargets.csv.gz"))[grepl("act_",set_name)]
+tfTargets <- split(tfTargets$to, f=tfTargets$tf_name)[unique(grnGenes$gene_symbol)]
+```
+
+Calculate module scores:
+
+```{r}
+tfscores.ccri <- calculateModuleScore(Seurat::as.sparse(vsd.ccri), lapply(tfTargets, function(x) intersect(x, rownames(vsd.ccri))), nbin = 10) # I don't understand why, but some matrix operations in this function did not work for the CCRI dataset, if using normal Matrix format
+tfscores.target <- calculateModuleScore(vsd.target, lapply(tfTargets, function(x) intersect(x, rownames(vsd.target))), nbin = 10)
+tfscores.seqc <- calculateModuleScore(vsd.seqc, lapply(tfTargets, function(x) intersect(x, rownames(vsd.seqc))), nbin = 10)
+```
+
+Plot heatmaps (for Supplementary Fig. 14b):
+
+```{r, fig.width=18, fig.height=6}
+hmFun <- function(x, meta, n, grn_genes=grnGenes, annot_cols=annotCols) {
+  grn_genes <- grn_genes[grn_genes$gene_symbol%in%rownames(x),]
+  
+  hmData <- abscap(t(apply(x[grn_genes$gene_symbol,], 1, scale)))
+  #hmData <- abscap(x[grn_genes$gene_symbol,])
+  
+  hmAnnot <- meta[colnames(x), names(annot_cols)]
+  
+  list(
+    plot=ComplexHeatmap::pheatmap(hmData, border_color=NA, show_colnames = FALSE, annotation_col = hmAnnot, annotation_colors = annot_cols, cellheight = 9,  row_split=grn_genes$L1, color = rev(RColorBrewer::brewer.pal(9, "RdBu")), cellwidth=1, main = n, use_raster = TRUE),
+    data=rbind(study=rep(n, ncol(hmData)), t(hmAnnot),round(hmData,2))
+  )
+}
+
+hmTARGET <- hmFun(t(tfscores.target), mt, "TARGET")
+hmSEQC <- hmFun(t(tfscores.seqc), metadata.seqc.full, "SEQC") 
+hmCCRI <- hmFun(t(tfscores.ccri), mtc.complete, "CCRI") #, annot_cols = c(annotCols[c("gender", "MYCN_status", "inss_stage")], list( x17q_gain=c("yes"="black", "no"="white"))) )
+
+ComplexHeatmap::draw(hmSEQC$plot + hmTARGET$plot + hmCCRI$plot)
+
+pdf(file = resultsDir("../figures/figure_atac_heatmap_nbbulk_tfscores.pdf"), width=16, height=22)
+ComplexHeatmap::draw(hmSEQC$plot + hmTARGET$plot + hmCCRI$plot)
+dev.off()
+
+tmp <- data.table(hmTARGET$data, hmSEQC$data, hmCCRI$data, keep.rownames=TRUE)
+setnames(tmp, as.character(1:ncol(tmp)))
+fwrite(tmp, file=resultsDir("../figures/figure_atac_heatmap_nbbulk_tfscores_data.csv"))
+
+```
+
+### Plot mutation-score-related genes
+
+Use the same dataset and plotting functions to examine the expression of mutation-score-related genes in the three external datasets.
+(This is admittedly a little out-of-place here, because it's not making use of the ATAC-seq data... but it was convient to add at this point)
+
+Load mutation score:
+
+```{r}
+mutGenes <- latestCache(CACHE_SCRNA_MUT_GENES)[stage=="D9", .(L1=grp, gene_symbol=gene, rnk=`rank`)]
+mutGenes[,.N,by=L1]
+```
+
+Plot heatmap (for Supplementary Fig. 7c):
+
+```{r, fig.width=16, fig.height=8}
+hmFun <- function(x, meta, n, grn_genes, annot_cols=annotCols) { 
+  grn_genes <- grn_genes[grn_genes$gene_symbol%in%rownames(x),]
+  hmData <- abscap(t(apply(x[grn_genes$gene_symbol,], 1, scale)))
+  hmAnnot <- meta[colnames(x), names(annot_cols)]
+  rlabs <- NULL
+   list(
+    plot=ComplexHeatmap::pheatmap(hmData, border_color=NA, show_colnames = FALSE, labels_row = rlabs, annotation_col = hmAnnot, annotation_colors = annot_cols, cellheight = 9, cluster_rows = FALSE, row_split=grn_genes$L1, color = c("#0B9988", "#f7f7f7", "#F9AD03"), cellwidth=1, main = n, use_raster = TRUE),
+    data=rbind(study=rep(n, ncol(hmData)), t(hmAnnot),round(hmData,2))
+  )
+}
+
+mutGenesX <- mutGenes[gene_symbol%in%rownames(vsd.target) & gene_symbol%in%rownames(vsd.seqc) & gene_symbol%in%rownames(vsd.ccri), ][order(L1,-rnk),]
+
+hmTARGET <- hmFun(vsd.target, mt, "TARGET", grn_genes=mutGenesX)
+hmSEQC <- hmFun(vsd.seqc, metadata.seqc.full, "SEQC", grn_genes=mutGenesX) 
+hmCCRI <- hmFun(vsd.ccri, mtc.complete, "CCRI", grn_genes=mutGenesX)
+ 
+ComplexHeatmap::draw(hmSEQC$plot + hmTARGET$plot + hmCCRI$plot)
+
+pdf(file = resultsDir("../figures/figure_atac_heatmap_nbbulk_mutgenes.pdf"), width=16, height=48)
+ComplexHeatmap::draw(hmSEQC$plot + hmTARGET$plot + hmCCRI$plot)
+dev.off()
+
+tmp <- data.table(hmTARGET$data, hmSEQC$data, hmCCRI$data, keep.rownames=TRUE)
+setnames(tmp, as.character(1:ncol(tmp)))
+fwrite(tmp, file=resultsDir("../figures/figure_atac_heatmap_nbbulk_mutgenes_data.csv"))
+
+```
+
+Load single-cell data:
+
+```{r}
+scDataF <- latestCache(CACHE_SCRNA_DATA)
+```
+
+Plot MYCN levels (Supplementary Fig. 4f):
+
+```{r, fig.width=4, fig.height=4}
+mycnBaseTARGET <- mean(vsd.target["MYCN",mt[colnames(vsd.target), "MYCN_status"]=="Not Amplified"])
+mycnBaseSEQC <- mean(vsd.seqc["MYCN",metadata.seqc.full[colnames(vsd.seqc), "MYCN_status"]=="Not Amplified"])
+mycnBaseCCRI <- mean(vsd.ccri["MYCN",mtc.complete[colnames(vsd.ccri), "MYCN_status"]=="Not Amplified"])
+mycnBaseNCNB <- mean(scDataF$d["MYCN", scDataF$meta$ccondition=="cWT"])
+
+pData <- rbind(
+  data.table(MYCN=vsd.target["MYCN",], MYCN_fc=vsd.target["MYCN",]-mycnBaseTARGET, MYCN_status=mt[colnames(vsd.target), "MYCN_status"], study="TARGET"),
+  data.table(MYCN=vsd.seqc["MYCN",], MYCN_fc=vsd.seqc["MYCN",]-mycnBaseSEQC, MYCN_status=metadata.seqc.full[colnames(vsd.seqc), "MYCN_status"], study="SEQC"),
+  data.table(MYCN=vsd.ccri["MYCN",], MYCN_fc=vsd.ccri["MYCN",]-mycnBaseCCRI, MYCN_status=mtc.complete[colnames(vsd.ccri), "MYCN_status"], study="CCRI"),
+  data.table(MYCN=scDataF$d["MYCN",], MYCN_fc=scDataF$d["MYCN",]-mycnBaseNCNB, MYCN_status=scDataF$meta[colnames(scDataF$d), "ccondition"], study="This study")
+)
+
+pData[, MYCN_status_fac := factor(MYCN_status, levels=c("Amplified", "Not Amplified", "Unknown", "cWT", "c17q", "c17q1q", "c17q1qMYCN"), labels=c("Amplified", "Not amplified", "Unknown", "WT", "17q", "17q1q", "17q1qMYCN"))]
+
+pAbsolute <- ggplot(pData, aes(x=MYCN_status_fac, y=MYCN)) + geom_boxplot() + facet_grid(~study, scales="free_x", space = "free_x") + cowplot::theme_cowplot() + Seurat::RotatedAxis()
+pFc <- ggplot(pData, aes(x=MYCN_status_fac, y=MYCN_fc)) + geom_boxplot() + geom_hline(yintercept=0, linetype="dashed") + facet_grid(~study, scales="free_x", space = "free_x") + cowplot::theme_cowplot() + Seurat::RotatedAxis()
+
+print(pAbsolute / pFc)
+
+ggsave(pFc, filename=resultsDir("../figures/mycn_levels.pdf"), width=4, height=3)
+fwrite(pData[,.(study, MYCN=round(MYCN,2),MYCN_fc=round(MYCN_fc,2),MYCN_status)], resultsDir("../figures/mycn_levels_data.csv"))
+```
+
+
+
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

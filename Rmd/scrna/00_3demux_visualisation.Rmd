@@ -1,0 +1,382 @@
+---
+title: "demux_visualisation"
+author: "Luis Montano"
+date: '2023-08-21'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+params:
+  newsamplesheet: '~/metadata/10x_annotationsheet_2023-04_ncnb.xlsx'
+  datapath: '~/mnt_data/'
+  plotpath: '~/mnt_out/scrna/plots/'
+  cachedir: '/path/to/cachedir/'
+  metadatafolder: '~/metadata/'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Applying demultiplexing to all the libraries
+
+In this script we apply deMULTIplex2 to identify the separate cell lines in each multiplex sample G1-G27. Then we reformat the demultiplexing labels to a standard format which is similar to the cellranger multi output. 
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R  
+
+## Output
+
+The output of this script is the bash script bash/docker_execute_cellranger_olddata.sh used to run cellranger on the terminal. 
+
+# 1. Load utilities and requirements.
+
+```{r}
+
+source("~/R/scutils.R")
+
+# import data structure with important file paths
+
+# created fulldatapaths list with all the paths to be needed. 
+source("./ncnb2_code/R/importdata.R")
+
+cat("Global script parameters:\n")
+
+minfeatures=100
+mincells=100
+selecttop=5
+minfc=0.5
+mincpm=3
+pcdims=30
+vfeatures=2000
+
+```
+import external deMULTIplex 2 library
+
+```{r}
+
+devtools::install_github("Gartner-Lab/deMULTIplex2")
+```
+
+import datasets
+```{r}
+fullrecreate=F; fullreload=T
+selectednames=names(allcountpaths)[c(1, 3:27)]
+
+
+solist=lapply(selectednames, function(nm){
+  cat("Dataset ", nm, ":", "\nFetching and adapting metadata...\n")
+ 
+  simpleCache(paste_("raw_seurat_", nm), {
+  cat("Importing count matrices and HTO assay matrices into Seurat object...\n")
+so=CreateSeuratObject(Read10X_h5(allcountpaths[[nm]], use.names = TRUE, unique.features = TRUE)$`Gene Expression`, project=nm, min.cells=mincells, min.features=minfeatures)
+print(so)
+
+dmassay=  CreateAssayObject(data= Read10X_h5(allcountpaths[[nm]], use.names = TRUE, unique.features = TRUE)$`Multiplexing Capture`[, so %>% metadata %>% rownames]) 
+so[["demux"]]=dmassay
+
+cat("Labeling cell barcodes with dataset name...\n")
+so=RenameCells(so, new.names= lapply(so %>% colnames, function(x) strsplit(x, split="-")[[1]][1]) %>% unlist )
+so=RenameCells(so, add.cell.id=nm)
+
+so
+
+}, assignToVar="so", recreate=fullrecreate)
+  
+}) %>% givename(., selectednames)
+
+
+get.sample.from.bc= Vectorize(function(dataset, bcid){
+  (bcrels %>% filter( multiseq_id == bcid, experiment_group == dataset))$sample_name
+}, USE.NAMES=F)
+  
+
+
+## Adding basic metadata 
+solist=lapply(selectednames, function(nm){
+  cat("Dataset ", nm, ":", "\nFetching and adapting demux metadata...\n")
+ so=solist[[nm]]
+ percent.mt<- PercentageFeatureSet(so, pattern = "^MT-") %>% givecolnames(., nms="percent.mt")
+ 
+ 
+  simpleCache(paste0("cellmetadata_basic_dataset", nm), {
+  #assuming that all the relevant relationships
+  md=fread(demuxdatapaths[[nm]]) %>% as.data.frame %>% mutate( dsname=nm,  dsbarcode1=addprefix(Barcode, prefix=paste0(dsname,"_")), dsbarcode=trimone(dsbarcode1), experiment_group=dsname, multiseq_id=Assignment ) %>% col2names(., "dsbarcode")  %>% left_join(., bcrels, by=c("multiseq_id", "experiment_group")) %>% col2names(., "dsbarcode") 
+
+md2=cbind(md , md %>% pull(sample_name) %>% extractname %>% t %>% as.data.frame %>% giverownames(., nms=rownames(md)) ) %>% mutate(replicate=getrep(dsname), stage= stagename(dsname)) 
+
+
+
+cat("Incorporating dataset metadata...\n")
+fcat(md2 %>% pull(condition) %>% unique)
+relevantcells=rownames(md2)
+#removing cells that were prefiltered and thus not even subject to demux
+
+md2= cbind(md2,  percent.mt)
+
+md2}, assignToVar="md2", reload=fullreload, recreate=fullrecreate) 
+so= so[, rownames(md2)]  
+so= AddMetaData(so, metadata=md2)
+
+
+so
+}) %>% givename(., selectednames)
+```
+
+Produce a complete table associating, for each experiment, what each barcode name corresponds in terms of demux condition.
+
+the pattern is like this
+[samples]
+sample_id,cmo_ids
+WT_D0_R3,BC54
+17q_D0_R3,BC55
+17qx_D0_R3,BC59
+
+```{r}
+
+bckey=lapply(selectednames, function(nm){
+
+#### get cellranger config file for the dataset
+  
+fl= list.files(path=params$metadatafolder, pattern=paste0("cellrangerconfig_", nm, "_"))  
+
+
+file_content <- readLines(paste0(params$metadatafolder, fl))
+
+# Find the index of the line containing [samples]
+start_index <- grep("\\[samples\\]", file_content)
+
+# Extract the lines after [samples]
+lines_after_samples <- file_content[(start_index + 1):length(file_content)]
+
+# Create a table using data.table
+sample_table <- data.table::fread(text = lines_after_samples, header = TRUE, sep = ",")
+sample_table  %>% as.data.frame %>% mutate(dsname=nm)
+  
+}) %>% Reduce(rbind, .)
+
+
+bclist=lapply(selectednames, function(nm){
+
+#### get cellranger config file for the dataset
+  
+fl= list.files(path=params$metadatafolder, pattern=paste0("cellrangerconfig_", nm, "_"))  
+
+
+file_content <- readLines(paste0(params$metadatafolder, fl))
+
+# Find the index of the line containing [samples]
+start_index <- grep("\\[samples\\]", file_content)
+
+# Extract the lines after [samples]
+lines_after_samples <- file_content[(start_index + 1):length(file_content)]
+
+# Create a table using data.table
+sample_table <- data.table::fread(text = lines_after_samples, header = TRUE, sep = ",") %>% as.data.frame
+
+lii=list()
+for(k in 1:nrow(sample_table)){
+
+lii[[sample_table[k, "cmo_ids"]]]=sample_table[k, "sample_id"]
+}
+lii
+  
+}) %>% givename(selectednames)
+
+
+allbarcodes<- bckey %>% pull(cmo_ids)
+
+
+
+find.sample= Vectorize(function(ds, bc){
+
+  bc2=gsub("-", "_", bc)
+  
+  
+  if(is.null(bclist[[ds]][[bc2]])){
+    
+    if(!(bc2 %in% allbarcodes)){
+      bc2
+    }else{
+     bc 
+    }
+    }else{
+     bclist[[ds]][[bc2]]  
+    }
+}, USE.NAMES=F)
+  
+  
+
+
+```
+
+
+
+### demux with demMULTIplex2
+
+from https://github.com/Gartner-Lab/deMULTIplex2
+demultiplexTags() is the core function of deMULTIplex2. User must provide a tag count matrix where rows are individual cells and columns represent unique sample tags. You can load an example tag matrix from Stoeckius et al. (2018) by calling data(stoeckius_pbmc);tag_mtx <- stoeckius_pbmc. Use ?demultiplexTags in R to check details. It is strongly recommended to pre-filter the matrix to remove majority of the empty droplets for robust classification (See Troubleshooting for details).
+
+
+```{r}
+
+library(deMULTIplex2) 
+simpleCache(paste0("demultiplex2_alldatasets"),{
+alldemuxes.raw=lapply(selectednames, function(nm){
+
+res<- demultiplexTags(solist[[nm]]$demux[] %>% as.matrix %>% t, plot.path=params$plotpath, plot.name=paste0("demultiplex2", nm) )
+
+})
+names(alldemuxes.raw)= selectednames
+alldemuxes.raw
+}, assignToVar="alldemuxes.raw", reload=fullrecreate,recreate=fullrecreate)
+
+
+
+```
+
+Preparing the demux data to be added to the metadata
+
+```{r}
+simpleCache("demultiplex2_all_new_labels", { 
+newdemux.full=lapply(selectednames, function(nm){
+alldemuxes.raw[[nm]]$final_assign %>% as.data.frame %>% givecolnames(., nms="demux2")
+}) %>% givename(selectednames)
+newdemux.full
+}, assignToVar="newdemux.full", reload=F, recreate=T)
+
+
+################################################################################
+#
+################################################################################
+
+simpleCache("demultiplex2_all_processed", { 
+newdemux.full.processed=lapply(selectednames, function(nm){
+
+  fcat("formatting demultiplexing info for dataset", nm, "...")
+  mat=newdemux.full[[nm]] %>% mutate(demux2.corrected= find.sample(bc=demux2, ds=nm))
+
+demux2conditions=mat %>% pull(demux2.corrected) %>% extractname %>% t %>% as.data.frame 
+mat=mat %>% mutate(stage=demux2conditions$stage, cell.line=demux2conditions$cell.line, condition2=demux2conditions$condition, ccondition=demux2conditions$condition, demux2.edited= edit.demux(demux2.corrected), conditiondemux2=get_condition_demux(condition2,demux2.edited ))
+}) %>% givename(., selectednames)
+
+}, assignToVar="newdemux.full.processed", reload=F, recreate=T)
+
+```
+
+Incorporate all metadata and all quality control cutoffs and calculations already into metadata. qcglobal indicates whether a cell passed all quality controls
+
+```{r}
+########################################################################################
+#load previous qc steps
+########################################################################################
+#load relevant caches from above
+fullrecreate=F; fullreload=T
+simpleCache(paste0("scdblscores_all_dbr", dbr),assignToVar="alldbscores", reload=T)
+simpleCache("cellcycle_information_all_datasets", assignToVar="cc.information", reload=T)
+simpleCache("edropletsdata_formatted", assignToVar="alldroplets.ready", reload=T)
+simpleCache("demultiplex2_all_new_labels", assignToVar="newdemux.full", reload=T)
+
+solist= lapply(selectednames, function(nm){
+  fcat("Dataset", nm)
+  #reload basic metadata just in case anything was not loaded yet
+  simpleCache(paste0("cellmetadata_basic_dataset", nm), assignToVar="md2", reload=fullreload, recreate=fullrecreate) 
+  solist[[nm]] =AddMetaData(solist[[nm]], md2)
+  #incorporate cutoffs
+  solist[[nm]]= AddMetaData(solist[[nm]], solist[[nm]] %>% metadata %>% mutate( counts.cutoff=qcpars[[nm]]$counts, features.cutoff= qcpars[[nm]]$features, mito.cutoff=qcpars[[nm]]$mito, qcc.pass=((nFeature_RNA>=features.cutoff & nCount_RNA >= counts.cutoff & percent.mt<= mito.cutoff )),scDblFinder.doubletrate=dbr, dbcutoff=getdbcutoff(dsname) ))
+  
+  
+  #incorporate droplets, cc, cutoffs
+  
+  solist[[nm]] =AddMetaData(solist[[nm]], alldroplets.ready[[nm]] )
+  solist[[nm]] =AddMetaData(solist[[nm]], cc.information[[nm]] )
+  solist[[nm]] =AddMetaData(solist[[nm]], alldbscores[[nm]] )
+  
+  #incorporate variable that has the conditions, or failed demux category when present
+  solist[[nm]]@meta.data[, "demux_classif"]=solist[[nm]]@meta.data[[demuxvar]] %>% classifydemux
+  
+  
+  solist[[nm]] = AddMetaData(solist[[nm]], solist[[nm]] %>% metadata %>% mutate(stage=stagename(dsname),
+                        dayds=paste_(stage, dsname),
+                        conditiondemux=get_condition_demux(condition, demux_classif),
+                        dbcutoff=getdbcutoff(dsname),
+                        edqc.pass= (scdblscore<= dbcutoff & !isemptydroplet),
+                        qcpass.global= edqc.pass & qcc.pass))
+  
+  
+################################################################################
+#incorporate alternative demux info
+################################################################################
+ solist[[nm]] = AddMetaData(solist[[nm]], newdemux.full[[nm]]) 
+  
+}) %>% givename(., selectednames)
+
+
+simpleCache("allpreqc-metadata", {
+allmetadata =solist %>% lapply(., function(x) x %>% metadata %>% mutate(stage=stagename(dsname), replicate=getrep(dsname), demux2.corrected= find.sample(bc=demux2, ds=dsname)) %>% select(-matches("_cnts"))  %>% select(-matches("CMO")) %>% select(-matches("^BC"))   ) %>% Reduce(rbind, .) 
+}, assignToVar="allmetadata", recreate=T)
+```
+
+Block to edit demux outputs so demux variables are equally formatted
+
+```{r, fig.width=15, fig.height=15}
+sw=.5
+sca=20
+
+edit.demux= Vectorize(function(x){ 
+  if(is.na(x)) {return("Blank")}else{
+    if(x=="multiplet") {return("Multiplet")}else{
+      if(x=="negative") {return("Unassigned")}else{
+        return(x)
+      }
+  }
+  }
+}, USE.NAMES=F)
+
+
+
+
+```
+
+Execute the demux formatting  and visualise comparisons between cellranger demux and deMultiplex2
+
+```{r, fig.width=15, fig.height=15}
+
+################################################################################
+# formatting demux results
+################################################################################
+
+demux2conditions=allmetadata %>% pull(demux2.corrected) %>% extractname %>% t %>% as.data.frame %>% mutate(condition2=condition) %>% select(condition2)
+allmetadata.demux2=allmetadata %>% cbind(., demux2conditions) %>% mutate(demux2.edited= edit.demux(demux2.corrected), conditiondemux2=get_condition_demux(condition2,demux2.edited ))
+
+
+demuxes=allmetadata.demux2 %>% group_by( dsname, conditiondemux, conditiondemux2) %>% summarise( counts=n()) %>% ungroup %>% group_by(dsname) %>% mutate(Freq=counts/sum(counts)) %>% ungroup() %>% as.data.frame 
+
+
+demuxes2=allmetadata.demux2 %>% names2col(., coln="cell") %>% select(cell, dsname, conditiondemux, conditiondemux2 ) %>% group_by( dsname, conditiondemux, conditiondemux2) %>% summarise( counts=n())  %>% group_by(dsname) %>% mutate(Freq=counts/sum(counts)) %>% ungroup() 
+
+demuxes2=demuxes %>% mutate(id=1:nrow(demuxes2)) %>% pivot_longer(., cols=c("conditiondemux", "conditiondemux2"), names_to="demuxround", values_to="classif") %>% as.data.frame
+
+
+levs=c( "cWT", "c17q", "c17q1q", "c17q1qMYCN", "Multiplet",  
+"Blank","Unassigned")
+tpdf(path=params$plotpath, paste0("alluvialv2_demux1_vs_demux2_"), width=pw*5/2*sca/10, height=pw*sca*3/14)
+ge=ggplot(demuxes2,
+          aes(y = Freq, x=factor(demuxround, levels=c("conditiondemux", "conditiondemux2")), stratum=factor(classif, levels=levs), alluvium=id, fill=factor(classif, levels=levs)))+ 
+  geom_flow() +
+  geom_stratum(width = sw, alpha=0.5) +
+  geom_text_repel(stat = "stratum", aes(label = after_stat(stratum)), min.segment.length=0.1) +
+  scale_x_discrete(expand= c(.1, .1), labels = c("cellranger_multi", "demultiplex2"))+
+  theme(legend.position="none")+
+  facet_wrap(~dsname)+
+  theme_classic()
+ge
+dev.off()
+
+ge
+```
+

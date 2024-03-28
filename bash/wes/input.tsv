@@ -1,0 +1,12 @@
+NCNBH7	NA	0	H7S14	L002	${data_root_host}genotyping-WES/NCNBH7_WES_2021/H7S14.bam
+NCNBH7	NA	1	H7S14-MYCN	L002	${data_root_host}genotyping-WES/NCNBH7_WES_2021/H7S14_MYCN.bam
+NCNBH7	NA	1	1q	L002	${data_root_host}genotyping-WES/NCNBH7_WES_2021/S_1q.bam
+NCNBH7	NA	1	17q	L002	${data_root_host}genotyping-WES/NCNBH7_WES_2021/S_17q.bam
+NCNBH7	NA	1	17q1q	L002	${data_root_host}genotyping-WES/NCNBH7_WES_2021/S_17q1q.bam
+NCNBH7	NA	1	17q-MYCN	L002	${data_root_host}genotyping-WES/NCNBH7_WES_2021/S_17q_MYCN.bam
+NCNBH7	NA	1	S_17q_MYCN_D19_t_wes	L001	${data_root_host}genotyping-WES/NCNBH7_WES_2023_D19/S_17q_MYCN_D19.bam
+NCNBH7	NA	1	S_17q_MYCN_DOX_D19_t_wes	L001	${data_root_host}genotyping-WES/NCNBH7_WES_2023_D19/S_17q_MYCN_DOX_D19.bam
+NCNBH7	NA	1	S_17q1q_MYCN_D19_t_wes	L001	${data_root_host}genotyping-WES/NCNBH7_WES_2023_D19/S_17q1q_MYCN_D19.bam
+NCNBH7	NA	1	S_17q1q_MYCN_DOX_D19_t_wes	L001	${data_root_host}genotyping-WES/NCNBH7_WES_2023_D19/S_17q1q_MYCN_DOX_D19.bam
+NCNBH7	NA	1	WT_MYCN_D19_t_wes	L001	${data_root_host}genotyping-WES/NCNBH7_WES_2023_D19/WT_MYCN_D19.bam
+NCNBH7	NA	1	WT_MYCN_DOX_D19_t_wes	L001	${data_root_host}genotyping-WES/NCNBH7_WES_2023_D19/WT_MYCN_DOX_D19.bam

@@ -1,0 +1,187 @@
+---
+title: "Reprocessing and demultiplexing of G1-G13"
+author: "Luis Montano"
+date: '2023-07-19'
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Processing of samples G14-G27 on cellranger
+
+These samples from 10X Genomics were obtained in 2020. They are subject to a completely different path structure and thus were dealt with separately. 
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R 
+
+## Output
+
+The output of this script is the bash script bash/docker_execute_cellranger_olddata.sh used to run cellranger directly the terminal. 
+
+#  preparation of samplesheets for the reprocessing ofcellranger on G1 G13
+
+```{r}
+
+samplesheet=fread("~/mnt_oldsinglecell/samples_multiseq.csv")
+bcsheet=fread("~/mnt_oldsinglecell/multiseq_barcodes.csv")
+
+#collect all run  names
+allnames=samplesheet %>% pull(bsf_name)
+#retrieve all names without empty strings, which appeared because runs failed etc
+allnames=allnames[nzchar(allnames)] %>% unique
+
+pattern="5P(BC)"
+readd="R2"
+
+getbcsequence=Vectorize(function(bcn){
+ 
+  bcsheet %>% filter(multiseq_id==bcn) %>% pull(multiseq_sequence)
+}, USE.NAMES=F)
+
+
+```
+
+## Generate feature ref files for each dataset
+
+
+```{r}
+
+for(nm in allnames){
+
+  fwrite(samplesheet %>% filter(bsf_name==nm) %>% select(sample_name, multiseq_id) %>% mutate(name=sample_name, id=multiseq_id, read=readd, pattern=pattern, sequence=getbcsequence(multiseq_id), feature_type="Multiplexing Capture") %>% select(id, name, read, pattern, sequence, feature_type)
+  , file= paste0("~/ncnb2_noncode/metadata/cmo-set_", nm,".csv")) 
+}
+```
+
+## Generate config files for each dataset, which indicate tge GEX files, the BC files, and the barcode IDs. 
+
+The code below will assemble a config file of the following form. 
+
+[gene-expression]
+reference,/grphome/resources/cellranger_data/refdata-gex-GRCh38-2020-A/ 
+cmo-set,/prjhome/ncnb2_noncode/metadata/cmo-set_G1_GEX.csv
+[libraries]
+fastq_id, fastqs, feature_types
+G1_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L1/NCNB_10X_1_L4674/G1_GEX/,Gene Expression
+G1_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L2/NCNB_10X_1_L4674/G1_GEX/,Gene Expression
+G1_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L3/NCNB_10X_1_L4674/G1_GEX/,Gene Expression
+G1_GEX,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L4/NCNB_10X_1_L4674/G1_GEX/,Gene Expression
+G1_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L1/NCNB_10X_1_L4674/G1_BC/,Multiplexing Capture
+G1_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L2/NCNB_10X_1_L4674/G1_BC/,Multiplexing Capture
+G1_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L3/NCNB_10X_1_L4674/G1_BC/,Multiplexing Capture
+G1_BC_1,/grphome/data/ncnb/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_L4/NCNB_10X_1_L4674/G1_BC/,Multiplexing Capture
+[samples]
+sample_id,cmo_ids
+WT_D0_R1,BC89
+17q_D0_R1,BC2
+17qx_D0_R1,BC3
+
+
+Assemble the cmo config files for each cellranger run
+```{r}
+
+cellranger.ref.path="/path/to/cellranger_refdata/refdata-gex-GRCh38-2020-A/"
+
+realrootdir=paste0(config$data_root_host, "/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_")
+functionalrootdir="~/mnt_data/path/to/NCNB_10X_1_L4674__BSF_0896_HVCHJDSXY/BSF_0896_HVCHJDSXY_"
+
+#guide array that allows to format the GEX and BC runs accordingly under the same folder. 
+typlist=list(GEX="/,Gene Expression", BC="/,Multiplexing Capture")
+
+nfsheet = lapply(allnames, function(nm){
+  filestr=paste0("~/metadata/cellrangerconfig_", nm, ".csv")
+csvfile <- file(filestr, "w")
+writeLines("[gene-expression]", csvfile)
+
+writeLines(paste0("reference,", cellranger.ref.path), csvfile)
+writeLines(paste0("cmo-set,", config$project_root_host, "/metadata/cmo-set_", nm, ".csv"), csvfile)
+writeLines("[libraries]", csvfile)
+writeLines("fastq_id, fastqs, feature_types", csvfile)
+
+lapply(1:length(typlist), function(x){
+lapply(c("L1", "L2", "L3", "L4"), function(l){
+  
+  #replace GEX in the name by either GEX or BC
+  newnm= gsub("GEX", names(typlist[x]), nm)
+  
+  functionalsubdir= paste0(functionalrootdir, l, "/NCNB_10X_1_L4674/", newnm)
+  realsubdir= paste0(realrootdir, l, "/NCNB_10X_1_L4674/", newnm)
+
+  
+  #write a line with the dataset id, the path to the file, and the feature type
+  if(names(typlist[x])=="BC"){
+  linne=pastec(paste0(newnm, "_1"), paste0(realsubdir, typlist[[x]]))
+  }else{
+  linne=pastec(newnm, paste0(realsubdir, typlist[[x]]))
+  }
+  writeLines(linne, csvfile)
+  
+
+  
+})
+  
+})
+
+  writeLines("[samples]", csvfile) 
+  writeLines("sample_id,cmo_ids", csvfile) 
+  bcids=samplesheet %>% mutate(fastq_sample=paste0(strsplit(nm, split="_")[[1]][1], "_BC_1")) %>% filter(bsf_name==nm) %>% select(sample_name, multiseq_id)
+
+#writeLines(smpln, csvfile)  
+  lapply(1:nrow(bcids), function(x){
+writeLines(paste0(bcids[x, ], collapse=","), csvfile)  
+})
+
+
+close(csvfile) 
+filestr
+
+})
+ 
+
+```
+
+# Assemble the bash script to to run cellranger for each dataset via a local docker image
+
+```{r}
+
+localmem=90
+localcores=12
+
+scriptfile=file("~/bash/docker_execute_cellranger.sh", "w")
+
+writeLines(paste0("PROJHOME=", config$project_root_host), scriptfile)
+writeLines(paste0("WORKHOME=", config$out_root_host), scriptfile)
+
+
+
+
+writeLines("IDS=$(id -u):$(id -g)", scriptfile)
+writeLines("rm -rf ${WORKHOME}", scriptfile)
+writeLines("mkdir -p ${WORKHOME}", scriptfile)
+
+allfilenames<- seq(1,13,1) %>% paste0("G", ., "_GEX")
+for(nm in allfilenames){
+
+  dockerstrings=list('docker run --name "${USER}_cellranger2" -it --rm --user ${IDS}', 
+'-v ${WORKHOME}:/work', 
+'-v ${GRPHOME}:/grphome' ,
+'-v ${PROJHOME}:/prjhome',
+'cancerbits/cellranger-7.1.0 multi',
+paste0('--id=', nm), 
+paste0('--csv=/prjhome/metadata/cellrangerconfig_', nm,'.csv'), 
+
+paste0('--localmem=', localmem),
+paste0('--localcores=', localcores),
+"\n"
+
+) %>% paste(., collapse=" ")
+fcat(dockerstrings)
+writeLines(dockerstrings, scriptfile)
+}
+close(scriptfile)
+  
+```
+

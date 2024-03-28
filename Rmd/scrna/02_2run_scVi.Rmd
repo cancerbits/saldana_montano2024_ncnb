@@ -1,0 +1,174 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: Dataset integration"
+author: "Florian Halbritter"
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '/path/to/cachedir/'
+---
+
+# Integration of all datasets past quality control with scvi.
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R as well as the output simple_merge_all_filtered_datasets.RData produced by scrna/02_1...Rmd
+
+## Outputs
+
+different scvi reductions run on different features, specifically seurat_scviall_RNA_counts_hvg.RData which uses the RNA counts and the highly variable features.  
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r}
+source("R/setup.R")
+source("R/scutils.R")
+
+```
+Functions specifically used in this notebook.
+
+```{r}
+resultsDir <- function(...) {
+  paste0(config$out_root, "/scrna/", ...)
+}
+
+runSCVI <- function(so, use_assay = "RNA", use_data = "counts", use_hvg = FALSE, n_epochs = 50, out_dir = resultsDir()) {
+  
+  soTmp <- so
+  if(use_hvg) soTmp <- soTmp[intersect(rownames(soTmp),VariableFeatures(soTmp)), ]
+  
+  # convert to anndata:
+  adata <- convertFormat(soTmp, from="seurat", to="anndata", assay=use_assay, main_layer=use_data, drop_single_values=FALSE)
+  print(adata)
+  
+  # run setup_anndata
+  scvi$model$SCVI$setup_anndata(adata, batch_key="replicate")
+  
+  # create the model
+  model <- scvi$model$SCVI(adata)
+  
+  # train the model
+  model$train(max_epochs = as.integer(n_epochs))
+  
+  # get the latent represenation
+  lat <- model$get_latent_representation()
+  
+  # create DimReduc
+  lat <- as.matrix(lat)
+  rownames(lat) <- colnames(so)
+  
+  so[["scvi"]] <- CreateDimReducObject(embeddings = lat, key = "scvi_", assay = use_assay)
+  
+  return(list(model=model, so=so))  
+}
+
+options("RCACHE.DIR"=resultsDir("/rcache/"))
+```
+
+
+# Dataset integration with scVI
+
+## Set up python 
+
+Load the right conda environment:
+
+```{r}
+library(reticulate)
+use_condaenv("/opt/conda/envs/scvi")
+py_config()
+```
+Load libraries:
+
+```{r}
+library(sceasy)
+scvi <- import("scvi", convert = FALSE)
+```
+
+## Prepare input datasets
+
+Get merged and normalized Seurat object for input data:
+
+```{r}
+nHVG <- 5000
+cacheSuffix <- paste0("_hvg", nHVG)
+if(nHVG == 3000) cacheSuffix <- "" # no suffix for default
+
+simpleCache(paste0("sct_ccvar_all_filtered_datasets",cacheSuffix), {
+  simpleCache("simple_merge_all_filtered_datasets", assignToVar="soTmp")
+  BiocManager::install("glmGamPoi", update = FALSE, ask = FALSE)
+  soTmp <- SCTransform(soTmp, method = "glmGamPoi", variable.features.n=nHVG, vars.to.regress = "ccvar", verbose = TRUE)
+  return(soTmp)
+}, assignToVar="soMerged", reload=TRUE)
+```
+
+Subset full dataset to WT:
+
+```{r}
+soWT <- subset(soMerged, ccondition=="cWT")
+```
+
+
+## Run scVI... Full dataset
+
+Execute scVI with the full dataset and plot UMAPs:
+(try different combinations of input data and feature selections)
+
+```{r, fig.width=16, fig.height=5}
+nDim <- 10
+scviInput <- "all"
+so <- soMerged
+if(scviInput=="wt") so <- soWT
+if(scviInput=="test") so <- soWT[sample(nrow(soWT), 1000), sample(ncol(soWT), 1000)]
+
+for(scviHVG in c(TRUE, FALSE)) {
+  for(scviAssay in c("RNA")) {  
+    for(scviData in c("counts")) { 
+      
+      n <- paste_(scviInput, scviAssay, scviData, ifelse(scviHVG, "hvg", "all"))
+      msg(n)
+      
+      simpleCache(paste0("seurat_scvi", n), { 
+        # train and retrieve latent space:
+        scviResult <- runSCVI(so, use_assay = scviAssay, use_data = scviData, use_hvg = scviHVG)
+        
+        # save scVI model:
+        scviResult$model$save(resultsDir("scvi_models/", n), prefix=paste0(n, "_"), save_anndata = FALSE)
+      
+        return(scviResult$so) 
+      }, cacheDir=resultsDir("rcache"), assignToVar="so")
+
+      so <- RunUMAP(so, dims = 1:nDim, reduction = "scvi", n.components = 2)
+      p <- DimPlot(so, group.by=c("replicate","ccondition","stage"), label=TRUE) + ggtitle(sprintf("%s (n_dim = %d)", n, nDim))
+      
+      ggsave(filename = resultsDir("scvi_umap_", n, ".pdf"), plot = p, width=16, height=5)
+      print(p)
+    }
+  }
+}
+```
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```
+

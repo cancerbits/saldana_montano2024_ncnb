@@ -1,0 +1,409 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: 07 chromosomal breakpoint mapping analysis"
+author: "Luis Montano"
+date: '2023-09-26'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+  outpath: '~/mnt_out/figures/'
+  resourcepath: "~/mnt_resources/"
+  infercnvpath: '~/path/to/input_data/infercnv/'
+  gtfpath: '~/path/to/gencode.v40.annotation.gtf.gz'
+  downloadedfilepath: '~/path/to/downloaded_files/'
+  
+---
+# Comparative characterisation of chromosomal breakpoints in cell lines
+
+## Dependencies
+
+This script depends on some functions and objects on R/importdata.R and the script R/scutils.R It also depends on the output of the CNA section of this work to obtain some of the inputs, specifically NB_cell_line_1q_17q_aberrations_coordinates_simple.csv
+
+## Outputs
+
+* NB_cell_line_all_aberrations_coordinates_wgenes.csv which is used as an input for the whole exome sequencing neuroblastoma SNV analysis. 
+* Contents of Suplementary figure 4
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+Generating plots for the 17q and 1q gains across 88 neuroblastoma patients from an Austrian cohort. 
+
+
+### Load functions and dependencies
+
+```{r}
+
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+
+################################################################################
+# parameters
+################################################################################
+mingapwidth=400000
+
+```
+
+### Load specific functions for this script
+
+```{r}
+find.lg.column= function(dff){
+lapply(1:ncol(dff), function(x) any(c("L", "G") %in% (dff %>% pull(x) %>% unique)))  %>% unlist %>% which
+}
+
+
+updown = Vectorize( function(d){
+  if(d=="L"){
+   -1 
+  }else{
+    if(d=="G"){
+      1
+  }
+  
+  }
+}, USE.NAMES=T)
+
+
+getmaxima=Vectorize(function(s, n){
+  if((s %in% names(maxima2)) && (n %in% names(maxima2[[1]]))){ 
+    maxima2[[as.character(s)]][[as.character(n)]]
+  }else{
+    fcat(s, n)
+    NA}
+  }, USE.NAMES=F)
+```
+
+
+### Incorporating paths for files and examining that they are all good
+
+```{r}
+bedpath= paste0(params$inputdata, "chromosomal_gain_beds")
+allptfiles= list.files(bedpath)
+
+allptnames= lapply(allptfiles, function(x) strsplit(x, split="_")[[1]][c(1,2)] %>% paste(., collapse="_"))
+
+
+allheads.colnumbers=lapply(allptfiles, function(fl){
+  
+  filepath= paste0(bedpath, "/", fl)
+  
+  df=fread(filepath, header=F) %>% as.data.frame %>% head(5)
+df %>% colnames %>% length
+}
+  ) %>% givename(allptnames)
+
+allheads=lapply(1:length(allptfiles), function(x){
+  fl=allptfiles[[x]]
+  filepath= paste0(bedpath, "/", fl)
+  
+  df=fread(filepath, header=F) %>% as.data.frame %>% mutate(pt.id=allptnames[[x]])
+df
+}
+  ) %>% givename(allptnames)
+
+################################################################################
+#dealing with patient groups in which different columns indicate gain or loss and harmonising
+################################################################################
+
+all20s=allheads.colnumbers %>% unlist %>% as.data.frame %>% filter(.==20) %>% rownames
+
+allnon20s=allheads.colnumbers %>% unlist %>% as.data.frame %>% filter(.!=20) %>% rownames
+
+
+dfmerge1=lapply(allheads[all20s], function(dff) dff %>% select(V1, V2,V3, V18, pt.id) %>% givecolnames(., nms=c("V1","V2","V3", "V4", "pt.id"))) %>% Reduce(rbind, .)
+
+dfmerge2= lapply(allheads[allnon20s], function(dff) dff %>% bind_rows %>% select(V1, V2,V3, find.lg.column(dff %>% bind_rows), pt.id) %>% givecolnames(., nms=c("V1","V2","V3", "V4", "pt.id"))) %>% Reduce(rbind, .)
+
+```
+
+### merging data from  differently formatted patients
+
+```{r}
+
+dfmerge=rbind(dfmerge1, dfmerge2)
+
+df117.1=dfmerge %>% filter(V1 %in% c("chr1", "chr17"), V4 %in% c("G", "L"))
+
+df117.2=df117.1 %>% mutate(V3=as.numeric(V3), V2=as.numeric(V2),size= as.numeric(V3)-as.numeric(V2) ) %>% filter(size>10000) %>% mutate( maxx=max(size), minn= min(size), norm.size=1-(size-minn)/(maxx-minn))  %>% group_by(V1, V4) %>% mutate(sizerank= rank(norm.size), y=sizerank*updown(V4)) %>% ungroup %>% as.data.frame %>% givecolnames(., ind=c(1,2,3), nms=c("seqnames", "start", "end"))
+mtd= df117.2 %>% select( maxx, minn, norm.size, sizerank, y)
+
+#creating a patient y rank based on the cumulative sum of all their fragments
+
+spellout= Vectorize( function(x){
+if(x=="G"){
+ return("Gain.patients") 
+}else{
+if(x=="L"){
+  return("Loss.patients")
+}else{
+ return(x) 
+}
+}}, USE.NAMES=F)
+
+
+################################################################################
+# rank the patients according to the added size of their CNAs and format the text. add a small random number to break ties
+################################################################################
+
+
+df117.r= df117.2 %>% group_by(pt.id, seqnames, V4) %>% mutate(sumsizes=sum(size), randn= rnorm(1)*0.02) %>% ungroup %>% group_by(seqnames, V4) %>% mutate(chrsizerank=rank(1/sumsizes)+randn, finalrank=as.numeric(factor(chrsizerank, levels=sort(unique(chrsizerank))))) %>% ungroup() %>% mutate(CNA_origin=spellout(V4))
+
+
+```
+
+### Mapping hg38 to hg19 so that  the coordinates are consistent with each other for the purpose of plotting.
+
+```{r}
+
+get.cn.effect=Vectorize(function(cnt){
+ if (cnt<2){return("L")}else{
+  if(cnt>2){return("G")}else{
+    return(NA)
+    } 
+ }
+}, USE.NAMES=F)
+
+resultsDir= function(...)  paste0(params$downloadedfilepath, ...)
+
+library(stringr)
+liftOver <- function(gr, from="hg19") {
+  
+  if(from!=config$genome_build) {
+    # download liftOver chain file:
+    chnF <- resultsDir( from, "To", str_to_title(config$genome_build), ".over.chain")
+    if(!file.exists(chnF)) {
+      dir.create(params$downloadedfilepath, showWarnings=FALSE)
+      download.file(paste0("https://hgdownload-test.gi.ucsc.edu/goldenPath/",from,"/liftOver/", basename(chnF), ".gz"), destfile=paste0(chnF,".gz"))
+      R.utils::gunzip(paste0(chnF,".gz"))
+    }
+    
+    chn <- rtracklayer::import.chain(chnF)  
+    gr <- rtracklayer::liftOver(gr, chn)
+  }
+  
+  return(gr)
+}
+
+################################################################################
+#  Declare default genome build to hg19
+################################################################################
+
+config=list(genome_build="hg19")
+
+sequenza.raw=fread(paste0(params$inputdata, "NB_cell_line_1q_17q_aberrations_coordinates_simple.csv")) %>% as.data.frame %>% mutate(V4=get.cn.effect(CNt)) %>% filter(total_tel_seg==F)
+
+samplenumbers=lapply(sequenza.raw %>% pull(sample), function(x)  generalreplace(x, c("17q", "wtMYCN", "wtMYCN_D19","wtMYCN_DOX_D19","17qMYCN","17qMYCN_D19", "17qMYCN_DOX_D19", "17q1qMYCN","17q1qMYCN_D19",  "17q1qMYCN_DOX_D19" ), 1:10))  %>% unlist
+sequenza.raw=sequenza.raw %>% mutate(sample_number=samplenumbers, cnv_number=1:nrow(sequenza.raw))
+
+
+
+edit.start.end=function(ptel, qtel, cstart, cend, chrsize){
+ ### condition 1.  none are telomeres, true segment
+  if( !ptel & !qtel & cstart != cend){
+  return(c(cstart, cend))
+  }
+  ### condition 2. there is a p telomere
+    if( ptel & !qtel & cstart == cend){
+  return(c(1, cend))
+    }
+  
+    ### condition 3. there is a q telomere
+    if( ptel & !qtel & cstart == cend){
+  return(c(cstart, chrsize))
+    }
+}
+
+
+sequenza=sequenza.raw %>% as.data.frame %>% dplyr::select(chromosome, start.pos, end.pos) %>% givecolnames(., nms=c("seqnames", "start", "end"))  %>% as(., "GRanges") 
+
+mapp=liftOver(sequenza, from="hg38")
+
+```
+
+
+### Create a table which serves as a reference to know exactly where to start drawing the cell lines on the plot, above the patients. 
+```{r}
+##table indicating the number of lines of the patients. 
+maxima= df117.r %>% group_by(seqnames, V4) %>% summarise(top=max(finalrank)) %>% pivot_wider(., names_from=c("V4"), values_from="top") %>% as.data.frame %>% col2names(., "seqnames") %>% dplyr::select(G, L)
+
+#restructure the above array manually into a list for efficiency of computing
+maxima2=list(chr1=list(G=maxima["chr1", "G"], L=maxima["chr1", "L"]), chr17=list(G=maxima["chr17", "G"], L=maxima["chr17", "L"]))
+
+```
+
+
+# Create a table describing the cell line segments matched to hg38 are merged back together when they are close enough for this. 
+
+```{r sequenzamergefilter}
+
+dff=lapply(1:length(mapp), function(x) mapp[[x]] %>% GenomicRanges::reduce(., min.gapwidth=mingapwidth) %>% as.data.frame %>% bind_rows %>% filter(seqnames==sequenza.raw[x, "chromosome"] ) %>% mutate(V4=sequenza.raw[x, "V4"], cell.line=sequenza.raw[x, "sample"],cnv.number=sequenza.raw[x, "cnv_number"], sample_number=sequenza.raw[x, "sample_number"],end_tel_q=sequenza.raw[x, "end_tel_q"], start_tel_p=sequenza.raw[x,"start_tel_p"] , chr_total_size=sequenza.raw[x,"chr_total_size"]    ))  %>% Reduce(rbind, .) %>% mutate(cell.line.number=sample_number*6*updown(V4)) #%>% group_by(cell.line, seqnames, V4, cnv.number, cell.line.number) %>% summarise(start=min(start), end=max(end))
+modify.start=Vectorize(function(start, end, chr, start_tel_p, chr_total_size ){
+ if( start==end & start_tel_p){
+  return(1)
+}else{return(start)}}, USE.NAMES=F)
+modify.end=Vectorize(function(start, end, chr, end_tel_q, chr_total_size ){
+ if( start==end & end_tel_q){
+  return(chr_total_size)
+}else{return(end)}}, USE.NAMES=F)
+
+dff= dff %>% mutate(start=modify.start(start, end,seqnames, start_tel_p, chr_total_size ), end=modify.end(start, end,seqnames, end_tel_q, chr_total_size))
+
+simpleCache("chromosomal_gain_segments", {
+size.threshold=1000000
+
+dff.gainsegments.filtered= dff %>% filter(width>=size.threshold)
+
+dff.gainsegments.filtered[3, "cell.line.number"]=24 #arranging the height at which to plot 17q
+
+
+dff.gainsegments.filtered}, assignToVar="dff.gainsegments.filtered", recreate=T)
+
+fwrite(dff.gainsegments.filtered, file=paste0(params$outpath, "/GRanges_cnv_summary_mingapwidth_", mingapwidth, ".csv"))
+
+```
+
+### supplementary figure 4 c   CNV pileup from multiple patients on chromosomes 1 and 17, together with our cell lines.
+
+```{r, fig.width=5, fig.height=3}
+cols=c(Gain.patients="#FF000088",
+       Loss.patients="#0000FF88",
+       cWT = "#777777",
+       cwtMYCN="#000000", 
+       cwtMYCN_DOX_D19="#555555", 
+       cwtMYCN_D19="#333333", 
+       c17q = "#00AD67",
+       c17qMYCN="#069af3",
+       c17qMYCN_D19= "#00ffff",
+       c17qMYCN_DOX_D19 = "darkturquoise",
+       c17q1qMYCN = "orange",
+       c17q1qMYCN_DOX = "magenta",
+       c17q1qMYCN_D19 = "magenta",
+       c17q1qMYCN_DOX_D19 = "deeppink2"
+)
+
+cols= cols[ c("Gain.patients", "Loss.patients", dff %>% pull(cell.line) %>% unique %>% paste0("c", .))]
+
+
+sca=1
+tpdf(path=params$outpath, "ChrBreakpoints", width=pw*sca*2.5, height=pw*sca,)
+chplot=ggplot(df117.r %>% as.data.frame)+ geom_segment(aes(x= start, xend=end, y=finalrank*updown(V4), yend=finalrank*updown(V4)  , color=CNA_origin))+
+  geom_rect(data=centromeres, aes(xmin=start, xmax=end, ymin=-Inf, ymax=Inf) , fill="grey", alpha=0.5)+
+  geom_text(data=centromeres, aes(x= (start+end)/2-((start+end)/100), y=10,label=region), angle=90, color="black")+  
+  facet_wrap(~seqnames, scale="free")+
+  theme_classic()+
+  rotatex(90)+
+  geom_segment(data=dff.gainsegments.filtered %>% mutate(cell.line=paste0("c", cell.line), cell.line.number=cell.line.number-20), inherit.aes=F, aes(x= start, xend=end, y=cell.line.number+getmaxima(seqnames, V4), yend=cell.line.number+getmaxima(seqnames, V4), color=cell.line), alpha=0.3, lineend="butt", size=6)+
+  scale_color_manual(values=cols)+
+  NoAxes()
+
+print(chplot)
+dev.off()
+```
+Finding what genes are inside each sequenza hg38 breakpoint
+
+```{r}
+
+  if(!exists("gtftable")){ 
+gtfpath=params$gtfpath
+
+gtftable=rtracklayer::import(gtfpath)
+}
+
+##getting positions for all the relevant genes
+genegtf=gtftable %>% as.data.frame %>% select(seqnames, start, end, gene_name, type)%>% filter(type=="gene")
+
+
+
+full.sequenza=fread(paste0(params$inputdata, "NB_cell_line_all_aberrations_coordinates.csv")) %>% as.data.frame 
+
+get.segment.genes= Vectorize(function(x) genegtf %>% as.data.frame %>% filter(seqnames==full.sequenza[x, "chromosome"], start>=full.sequenza[x, "start.pos"], end<=full.sequenza[x, "end.pos"]) %>% pull(gene_name) %>% paste(., collapse=";"), USE.NAMES=F)
+
+
+fwrite(full.sequenza %>% mutate(genes.in.segment=get.segment.genes(1:nrow(full.sequenza))), file=paste0(params$inputdata, "/NB_cell_line_all_aberrations_coordinates_wgenes.csv"))
+
+```
+
+### supplementary figure 4 B. Depth ratio plot of the cell lines in this study, without log
+
+```{r}
+
+copy.number.calls=fread(paste0(params$inputdata, "wesdata/NB_cell_line_copy_number_matrix.csv")) %>% as.data.frame 
+
+allcolors[["cnvcalls"]]=c(`1` = "blue",`2` = "grey", `3` = "red",`4` = "darkred" )
+
+
+pointpars=list( one=list(color="grey", shape=1, size=.01, 0.5), two=list(color="grey", shape=1, size=.0001, alpha=1))
+psel=2
+cnvfile= paste0(params$inputdata, "wesdata/NB_cell_line_depth_ratio_matrix.csv")
+
+
+  cnv= fread(cnvfile) %>% as.data.frame
+  
+  samples=c("H7S14-MYCN", "WT_MYCN_D19_t_wes","WT_MYCN_DOX_D19_t_wes",   "17q",  "17q-MYCN", 
+"S_17q_MYCN_D19_t_wes", "S_17q_MYCN_DOX_D19_t_wes", "17q1q", "S_17q1q_MYCN_D19_t_wes", 
+"S_17q1q_MYCN_DOX_D19_t_wes" 
+)
+  
+  #get the max length of each chromosome
+  
+  
+  rcnv= cnv %>% filter(chromosome!="chrY") %>% group_by(chromosome) %>% summarise(maxx=max(end)) %>% mutate( chrnumber=substr(chromosome, 4,6)) %>% as.data.frame
+  
+  
+  rcnv2=rcnv %>% mutate(chrnumber= lapply(rcnv %>% pull(chrnumber), function(x) generalreplace(x, c("1","2","3","4","5","6","7","8","9","10","11","12","13","14","15","16","17","18","19","20","21","22","X", "Y")  , c(1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22, 23, 24))))
+  rcnv2=rcnv2 %>% arrange(as.numeric(chrnumber))
+  shifts=(rcnv2 %>% pull(maxx) %>% as.numeric %>% cumsum)
+  shifts=append(0, shifts[1:22]) #move all elements one slot because each chromosome is displaced by the previous chromosome's length.
+  rcnv2=rcnv2 %>% arrange(as.numeric(chrnumber)) %>% mutate(shift=shifts)
+  chrs=rcnv2 %>% pull(chromosome); shi=  rcnv2 %>% pull(shift)
+  cnv=cnv %>% filter(chromosome!="chrY")
+  cnv= cnv %>% mutate(shift= lapply(cnv %>% pull(chromosome), function(x) generalreplace(x, chrs, shi))) %>% mutate(pos= as.numeric(start)+as.numeric(shift))
+  
+  
+  maxx=1.8
+sca=2
+  pls=lapply(samples, function(cell.line){
+    calls=copy.number.calls[, cell.line] %>% as.character
+    cnv = cnv %>% mutate(cnvcalls=!!calls)
+    cnv= cnv %>% mutate(zscore=(!!sym(cell.line)- mean(!!sym(cell.line), na.rm=T))/sd(!!sym(cell.line), na.rm=T))   
+    gg=ggplot(cnv, aes(x=pos, y=!!sym(cell.line)))+
+      geom_point_rast(aes(color=cnvcalls),
+                     shape=pointpars[[psel]]$shape, size=pointpars[[psel]]$size, alpha=pointpars[[psel]]$alpha)+
+      theme_classic()+
+      scale_color_manual(values=allcolors[["cnvcalls"]])+
+      coord_cartesian(ylim=c(0, maxx))+
+      geom_segment(data=rcnv2, aes(y=0, yend=2, x=shift, xend=shift), size=0.09)+
+      geom_text(data=rcnv2, aes(x=((shift)+(shift+maxx))/2, label=substr(chromosome, 4,6)), color="orange", angle=90, size=2.5*sca, y=.15)+
+      geom_hline(aes(yintercept=0), size=0.2)+
+      geom_hline(aes(yintercept=1), linetype=2, size=.2, col="grey")+
+      NoLegend()+
+      ylab("")+
+      xlab("")+
+      ggtitle(cell.line)+
+      remove_x_axis() 
+       gg %>% scale.text.general(., sca)
+
+})
+  
+  
+  
+    tpdf(path=params$plotpath, paste_("CNVplot_position_vs_depthratio_per_cellline"), wi=pw*sca*2, he=pw*sca*1.2)
+
+pls %>% Reduce('+', .)+plot_layout(nrow=5, ncol=2) 
+
+  dev.off()
+
+
+```
+
+
+## Session info etc.
+
+Runtime: `r time_diff(SETUP_TIME)`
+
+```{r}
+sessionInfo()
+```

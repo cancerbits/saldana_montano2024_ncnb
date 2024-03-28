@@ -1,0 +1,249 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: Mapping of single cells to the Kameneva and Jansky datasets"
+author: "Luis Montano"
+date: '2023-08-09'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  kamenevadata: "~/path/to/kamenevadata/"
+  janskydata: "~/path/to/janskydata/"
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Dataset annotation to the Kameneva and Jansky human embryonic adrenal gland datasets
+
+Mapping to the adrenal gland datasets is done in order to assist with dataset annotation, and making sure the divisions of thedataset reflect the biology behind. 
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R as well as the output simple_merge_all_filtered_datasets.RData produced by scrna/02_1...Rmd
+
+It is also important to download the following datasets and place them inside the inputdata folder:
+
+*Jansky 2021:  Go to https://adrenal.kitz-heidelberg.de/developmental_programs_NB_viz/, select download data and click on "Download Adrenal gland Data" Seurat Object (RDS) to download this.
+*Kameneva 2021: http://pklab.med.harvard.edu/artem/adrenal/data/Seurat/adrenal.human.seurat.scrublet.rds
+
+
+## Outputs
+
+Supplementary figure 2 j, a label transfer alluvial plot for the three datasets, and the metadata with the relevant annotations in kameneva_integration_metadata_fulldataset.RData
+
+
+```{r}
+
+source("~/R/scutils.R")
+
+# import data structure with important file paths
+
+# created fulldatapaths list with all the paths to be needed. 
+source("~/R/importdata.R")
+
+cat("Global script parameters:\n")
+
+minfeatures=100
+mincells=100
+selecttop=5
+minfc=0.5
+mincpm=3
+pcdims=30
+vfeatures=2000
+vfeatures.rna=5000
+mapping.umapdims=50
+```
+
+
+## Load the full in vitro dataset with markers
+
+```{r}
+fullrecreate=F; fullreload=T
+simpleCache("simple_merge_all_filtered_datasets", assignToVar="sma", reload=T)
+
+```
+
+
+## load the Kameneva dataset counts
+
+
+```{r }
+
+fullrecreate=F; fullreload=T
+
+simpleCache("adameyko_seurat", {
+ada= readRDS(file.path(params$kamenevadata, "adrenal.human.seurat.scrublet.rds"))
+ada
+},assignToVar="ada", recreate=fullrecreate, reload=fullreload)
+
+
+```
+
+ Processing the kameneva dataset
+
+```{r, echo=FALSE}
+fullrecreate=F
+fullreload=T
+verbose=T
+rass="refAssay"
+simpleCache("adameyko_seurat_sct_umap", {
+  ada=SCTransform(ada, new.assay.name=rass, variable.features.n=vfeatures.rna, assay="RNA" ) 
+  DefaultAssay(ada)=rass
+  ada=RunPCA(ada, assay=rass)
+   ada=RunUMAP(ada, assay=rass, dims=1:mapping.umapdims, verbose=F, return.model=T)
+}, recreate=fullrecreate, reload=fullreload, assignToVar="ada")
+
+
+ ass="sctscvi"    
+ ###############################################################################
+ # Quantify anchors and already transfer data
+ ###############################################################################
+   mappedcells=maptoref.pt1(query=sma, refdataset=ada, pdms=1:mapping.umapdims, mapvar="fate2",
+                            query.assay=ass,
+                            ref.assay=rass,
+                            reference.umap="umap",
+                            reference.pca="pca",
+                              querylabel="invitro", reflabel="kameneva", return.merge.metadata=F, return.query.metadata=TRUE, process.reference=F)
+   
+   simpleCache(paste_("seurat_adameykomapped", ass, "to", rass), {mappedcells$query}, recreate=fullrecreate, reload=fullreload, assignToVar="sma")
+   simpleCache(paste_("anchors_adameykomapped", ass, "to", rass), {mappedcells$anchors}, recreate=fullrecreate, reload=fullreload, assignToVar="anchors")
+   
+###############################################################################
+#perform umap coordinate mapping and export label transfer dataframe   
+################################################################################
+              
+   querymapped=maptoref.pt2(query=mappedcells$query, anchors=mappedcells$anchors, refdataset=mappedcells$ref, pdms=1:mapping.umapdims, mapvar="fate2",
+                            query.assay=ass,
+                            ref.assay=rass,
+                            reference.umap="umap", #which umap onto which we will project cells
+                            reference.pca="pca", # which reduction contains the reference's pca, particularly important if many exist
+                            reference.reduction="pca", # which reduction to quantify neighbors on
+                              querylabel="invitro", reflabel="kameneva", return.merge.metadata=F, return.query.metadata=TRUE, process.reference=F)
+
+
+sma=AddMetaData(mappedcells$query, metadata=querymapped)
+
+sma@meta.data= sma@meta.data %>% mutate(kamenevatype=mapfun_fate2, type=masktype(mapfun_fate2), type3=masktype3(mapfun_fate2))
+
+ 
+ simpleCache("seurat_alldatasets_mapped_kameneva", {sma}, assignToVar="sma", reload=F, recreate=T)
+ 
+ simpleCache("kameneva_integration_metadata_fulldataset", {
+ sma %>% metadata %>% select(kamenevaumap_1, kamenevaumap_2, mapfun_fate2, mapfun_fate2_predicted.id.score, mapfun_fate2_mapping.score,predicted.id, predicted.id.score, type, kamenevatype)
+ }, assignToVar="mappedmeta", recreate=T) 
+```
+
+
+Plot the mapped dataset to verify how the label transfer went
+
+
+```{r, fig.width=8, fig.height=3}
+
+
+library(viridis)
+umapred="umapog"
+    umap.df= umapdf(sma, reduction=umapred)
+    rk=paste0(umapred, "_")
+    
+    umapnn.name=paste0(umapred, "_nn")
+umapsnn.name=paste0(umapred, "_snn")
+graphchoice=umapsnn.name
+
+    
+    sca=10
+    rr=600
+    ssca=180
+    fillvar="clusterfrac"
+    clusvarname="seurat_clusters"
+
+
+polys=clusterhull(NULL, umap.df=umap.df, clusvar=clusvarname, clus=umap.df %>% pull(!!sym((clusvarname))) %>% unique, fillvar="null", linecolor="#000000", size=0.5, reduction.key=rk, fillcols="#FFFFFF00")
+
+pk=ggumap(sma, colorby=clusvarname, labelby=clusvarname, reductions=umapred, reduction.key=rk)+polys+NoAxes()
+ps=ggumap(sma, colorby="stage", labelby="stage", reductions=umapred, reduction.key=rk)+ NoLegend()+NoAxes()
+pt=ggumap(sma, colorby="type", labelby="type", reductions=umapred, reduction.key=rk)+NoAxes()+squarelegend("type", shape=0, size=6)
+pa=ggumap(sma, colorby="adameykotype", labelby="stage", reductions=umapred, reduction.key=rk)+
+  NoAxes()+squarelegend("adameykotype", shape=0, size=6)
+pm=ggumap(sma, colorby="ccondition", labelby="ccondition", reductions=umapred, reduction.key=rk)+NoAxes()+squarelegend("ccondition", shape=0, size=6)
+pt+ps+pm
+```
+
+Plot a category transfer alluvial plot to check how each categroy corresponds with cell types
+
+```{r, fig.height=5, fig.width=7}
+
+allcolors[["type"]]= allcolors[["type"]] %>% unlist
+g=transferplot(sma, labelvars=c("ccondition", "type"), column.width=0.35, facetvar="stage", colorlist=allcolors)
+g
+```
+
+
+
+ Comparing mappings between jansky and kameneva
+
+
+```{r}
+simpleCache("jansky_processed", {
+  janskycounts=readRDS(params$janskydata, "adrenal_gland_Seurat.rds")
+janskymeta= readRDS(file.path(params$inputdata, "jansky_adrenal_gland_annot.RDS"))
+jansky=CreateSeuratObject(counts=janskycounts, meta.data=janskymeta)
+jansky=SCTransform(jansky, method="glmGamPoi", variable.features.n=5000, new.assay.name="refAssay")
+jansky=RunPCA(jansky, dims=1:mapping.umapdims)
+jansky=RunUMAP(jansky, assay=rass, dims=1:mapping.umapdims, return.model=T)
+jansky=AddMetaData(jansky, jansky %>% metadata %>% mutate(janskytype=med_idents))
+jansky}, assignToVar="jansky", reload=T)
+
+
+simpleCache("mapping_metadata_fulldataset_jansky", {
+varrjansky="janskytype"
+maplist=maptoref.pt1(query=RenameAssays(sma, sctscvi="refAssay"), query.assay="refAssay", refdataset=jansky, pdms=1:dms, mapvar=varrjansky, querylabel="invitro", reflabel="jansky", return.merge.metadata=F, return.query.metadata=TRUE)
+
+  mapcon=maptoref.pt2(query=maplist$query, refdataset=maplist$ref,anchors=maplist$anchors, ref.assay=rass,query.assay=rass, mapvar=varrjansky, querylabel="invitro", reflabel="jansky",  reference.pca="pca", reference.umap="umap", reference.neighbors=umapnn.name.nns, return.merge.metadata=F, return.query.metadata=TRUE, process.reference=F)
+  mapcon}, assignToVar="mapcon", reload=T)
+  
+
+sma=AddMetaData(sma, metadata=mapcon %>% select(!!sym(mapfun(varrjansky)), !!sym( paste_(mapfun(varrjansky), "predicted.id.score")), !!sym( paste_(mapfun(varrjansky), "mapping.score")) ))
+
+```
+
+Export the metadata from Kameneva 
+
+```{r}
+
+ simpleCache("kameneva_integration_metadata_fulldataset", {
+ sma %>% metadata %>% select(kamenevaumap_1, kamenevaumap_2, mapfun_fate2, mapfun_fate2_predicted.id.score, mapfun_fate2_mapping.score,predicted.id, predicted.id.score, kamenevatype )
+ }, assignToVar="mappedmeta", recreate=T) 
+```
+
+
+```{r}
+janskytypes=jansky %>% metadata %>% pull(janskytype) %>% unique %>% as.character
+
+
+################################################################################
+
+# Supplementary data figure 2 j alluvial plot comparing mappings between jansky and kameneva
+
+################################################################################
+
+sca=0.5
+
+tp=transferplot(so=NULL, df=sma %>% metadata %>% filter(ccondition=="cWT", !(stage %in% c("D0", "D3"))) %>% mutate(Kameneva.cell.type=kamenevatype, Jansky.cell.type=mapfun_janskytype), labelvars=c("stage", "Jansky.cell.type", "Kameneva.cell.type"), colorlist=allcolors, column.width=0.35)
+
+tpdf(path=params$outpath, "figS2plots_tranferplot_stage_janskytypes_kamenevatypes", wi=pw*sca*1.3, he=pw*sca)
+print(tp)
+dev.off()
+
+
+
+```
+
+
+
+
+
+
+
+

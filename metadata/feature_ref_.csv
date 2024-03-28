@@ -1,0 +1,8 @@
+name,id,read,pattern,sequence,feature_type
+WT_D3_R2,WT_D3_R2,R2,5P(BC),CAAGGTCT,Antibody Capture
+17q_D3_R2,17q_D3_R2,R2,5P(BC),ATACGTGC,Antibody Capture
+17qx_D3_R2,17qx_D3_R2,R2,5P(BC),GCAGTATC,Antibody Capture
+WT_D19_R2,WT_D19_R2,R2,5P(BC),TCCGAGAT,Antibody Capture
+17q_D19_R2,17q_D19_R2,R2,5P(BC),CTCAAGGT,Antibody Capture
+17qx_D19_R2,17qx_D19_R2,R2,5P(BC),AGCTAGTC,Antibody Capture
+17qMYCN_D19_R2,17qMYCN_D19_R2,R2,5P(BC),GTCAATCG,Antibody Capture

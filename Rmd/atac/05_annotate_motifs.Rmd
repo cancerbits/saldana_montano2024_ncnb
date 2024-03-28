@@ -1,0 +1,149 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Annotation and enrichment analysis' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we scan the DNA sequences underlying the ATAC-seq peaks for matches with the binding motifs of transcription factors.
+This information is not directly displayed in the paper figures, but it is used later for enrichment analysis and gene-regulatory network construction.
+
+All `*_annotate_*.Rmd` notebooks compile metadata for the ATAC-seq peaks peaks which are then used in `08_enrichments.Rmd`.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(motifmatchr)
+library(TFBSTools)
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+peaksDt <- latestCache(CACHE_ATAC_PEAKS)
+geneAnnot <- latestCache(CACHE_GENE_ANNOT)
+expressedGenes <- latestCache(CACHE_SCRNA_EXPR)
+```
+
+# Load motif annotations
+
+Retrieve motif annotations from the HOCOMOCO database (download the files and save them locally):
+
+```{r load_hocomoco}
+motifFile <- getExternalFile("HOCOMOCOv11_full_HUMAN_mono_jaspar_format.txt", "https://hocomoco11.autosome.org/final_bundle/hocomoco11/full/HUMAN/mono/HOCOMOCOv11_full_HUMAN_mono_jaspar_format.txt") 
+motifFileAnnot <- getExternalFile("HOCOMOCOv11_full_annotation_HUMAN_mono.tsv", "https://hocomoco11.autosome.org/final_bundle/hocomoco11/full/HUMAN/mono/HOCOMOCOv11_full_annotation_HUMAN_mono.tsv") 
+```
+
+Read in motif database:
+
+```{r}
+simpleCache::simpleCache("hocomoco_v11", {
+	hocomoco <- universalmotif::read_jaspar(motifFile)
+	hocomoco <- XMatrixList(lapply(hocomoco, function(m) universalmotif::convert_motifs(m, class = "TFBSTools-PFMatrix")), use.names = F, type = "PFMatrixList",    matrixClass = "PFMatrix")
+	names(hocomoco) <- lget(hocomoco, "name", slot=TRUE)
+	return(hocomoco)
+}, assignToVar="mtfSet")
+
+hocoAnnot <- fread(motifFileAnnot)
+setkey(hocoAnnot, Model)
+
+print(mtfSet)
+print(head(hocoAnnot))
+```
+
+Fix gene names:
+
+```{r fix_genes}
+# T should be TBXT, the others are to be filtered out (both on Y chromosome)
+hocoAnnot[`Transcription factor`=="T", `Transcription factor`:="TBXT"]
+
+mtfSet <- mtfSet[hocoAnnot[names(mtfSet), `Transcription factor`] %in% geneAnnot$gene_name]
+
+mtfNames <- hocoAnnot[names(mtfSet), `Transcription factor`] 
+names(mtfNames) <- names(mtfSet)
+mtfLabels <- sprintf("%s (%s)", mtfNames, names(mtfNames))
+names(mtfLabels) <- names(mtfSet)
+
+mtfLabels <- versionedCache(CACHE_ATAC_MOTIF_LABELS, instruction={
+  mtf_labels
+}, buildEnvir=list(
+  mtf_labels=mtfLabels)
+)
+```
+
+
+# Scan peaks for motifs
+
+Use motifmatchr to scan the peaks:
+
+```{r scan_motifs}
+mtfMat <- versionedCache("motif_counts", instruction={
+	BiocManager::install("BSgenome.Hsapiens.UCSC.hg38", update=FALSE, ask=FALSE)
+	mtfs <- motifmatchr::matchMotifs(mtf_set, dtToGr(peaks_dt), genome=genome_build, out="scores") 
+	mtfMat <- as.matrix(motifmatchr::motifCounts(mtfs))
+	rownames(mtfMat) <- peaks_dt$rid
+	return(mtfMat)
+}, buildEnvir=list(
+  mtf_set=mtfSet, 
+  peaks_dt=peaksDt[,.(chrom,start,end,rid)],
+  genome_build=config$genome_build
+))
+```
+
+Map motif matches back to peaks and save the results for follow-up analyses:
+
+```{r save_motif_annots}
+db <- versionedCache(paste_(CACHE_ATAC_ENRICHDB_PREFIX, "motifs"), instruction={
+  mtf_mat <- mtf_mat[,mtfNames[colnames(mtf_mat)]%in%expr_genes]
+
+  db <- list(
+  	lists = apply(mtf_mat, 2, function(x) rownames(mtf_mat)[which(x>0)]),
+  	univ = names(which(rowSums(mtf_mat)>0)) # all peaks with at least one motif match
+  )
+  names(db$lists) <- mtf_labels[names(db$lists)]
+  
+  return(list(motifs=db))
+}, buildEnvir=list(
+  mtf_mat=mtfMat,
+  expr_genes=expressedGenes,
+  mtf_labels=mtfLabels
+))
+
+print(sapply(db$motifs$lists, length))
+```
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```

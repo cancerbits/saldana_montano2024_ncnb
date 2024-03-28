@@ -1,0 +1,102 @@
+---
+title: "Saldana, Montano, et al. -- scRNA-seq: 02_integration of the whole dataset using Seurat"
+author: "Luis Montano"
+date: '2023-07-18'
+output: html_document
+params:
+  inputdata: '~/path/to/input_data/'
+  plotpath: '~/path/to/plots/'
+  cachedir: '~/path/to/cachedir/'
+
+ 
+
+---
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+# Merging all G1-G27 datasets into a full dataset via a simple sparse matrix merge
+
+## Dependencies
+
+This script depends on some organiser paths on R/importdata.R and the script R/scutils.R It also needs the list of post quality control seurat objects from scrna/01_... Rmd as well as the metadata
+
+## Outputs
+
+a seurat merged seurat object comprising the 26 10x datasets, with the corrected metadata (accounting for sample mislabeling). simple_merge_all_filtered_datasets.RData
+
+
+### Import functions and set parameters. click on the "run all chunks above" icon below  to reload parameters
+
+```{r}
+source("~/R/scutils.R")
+source("~/R/importdata.R")
+
+nn=30L;
+mindist=.3;
+md=0.3
+res=.5
+pcdims=30
+vfeatures=2000
+selecttop=5
+minfc=0.5
+mincpm=3
+pcdims=30
+
+fdr=0.05
+vfeatures.rna=5000
+```
+
+## Load list of datasets just after quality control
+
+
+```{r pressure, echo=FALSE}
+
+simpleCache(paste0("ncnb2-filteredcovariates-seuratobjects_with_markers_vfeatures_", vfeatures), assignToVar="solist2", reload=T)
+
+```
+
+
+## simple merge of the datasets with each other using the sparse method. 
+```{r}
+
+simpleCache("simple_merge_all_filtered_datasets", {
+  
+  simpleCache("allpostqc-metadata", {
+allmetadata.filtered =solist2 %>% lapply(., function(x) x %>% metadata %>% mutate(stage=stagename(dsname), replicate=getrep(dsname)) %>% select(-matches("_cnts"))  %>% select(-matches("CMO")) %>% select(-matches("^BC"))   ) %>% Reduce(rbind, .) 
+}, assignToVar="allmetadata.filtered", reload=F, recreate=T)
+
+  
+  simpleCache("allpostqc-counts", {
+  allcounts= sccore::mergeCountMatrices(
+lapply(solist2, function(x) x@assays$RNA@counts
+  ))
+  }, assignToVar="allcounts", reload=T, recreate=T)  
+  
+sma=CreateSeuratObject(allcounts, meta.data=allmetadata.filtered, project="all_datasets_merge")
+
+
+##fixing labeling of 17q cells of the new dataset to be 17q1q based on the finding that 17q1q is the only cell line present
+
+correctcondition=Vectorize(function(ds, cond){
+newexpts= seq(14, 27, 1) %>% addprefix(., "G")
+if((ds %in% newexpts) && cond=="c17q"){
+ "c17q1q" 
+}else{
+ cond 
+}}, USE.NAMES=F)
+
+simpleCache("allpostqc-metadata-correctedcondition",{
+sma %>% metadata %>% mutate(ccondition.precorrection=ccondition, ccondition.corrected=correctcondition(dsname, ccondition), ccondition=ccondition.corrected)
+}, assignToVar="allmetadata.corrected", reload=T)
+
+sma@meta.data= allmetadata.corrected
+
+sma=AddMetaData(sma, sma %>% metadata %>% mutate(replicate=getrep(dsname)) %>% select(replicate))
+
+}, assignToVar="sma", reload=T)
+
+
+
+```
+
+

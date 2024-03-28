@@ -1,0 +1,30 @@
+project_name: ncnb2
+project_docker: cancerbits/dockr:ncnb2
+
+cnv_docker: ccribioinf/dockrstudio:4.2.0-v1
+wes_docker: ccribioinf/dockrstudio:4.0.3-v1
+
+# SYSTEM-SPECIFIC PARAMETERS (please change to match your local setup):
+
+project_root_host: /path/to/workdirectory/
+data_root_host: /path/to/data_storage_directory/
+out_root_host: /path/to/output_directory/
+resource_root_host: /path/to/tools_directory/
+pepatac_dir: /path/to/pepatac/
+pipes_dir: /path/to/pipes/
+tmp_root_host: /path/to/secondary_storage
+n_threads_max: INSERT_NUMBER_OF_THREADS
+
+# PATHS AS VISIBLE WITHIN RSTUDIO (should not be changed):
+project_root: /home/rstudio
+data_root: /home/rstudio/mnt_data
+out_root: /home/rstudio/mnt_out
+resource_root: /home/rstudio/mnt_resources/
+tmp_root: /home/rstudio/mnt_tmp/
+
+# PROJECT CONFIG:
+genome: path/to/cellranger_data/refdata-gex-GRCh38-2020-A
+genome_chromatin: path/to/refdata-cellranger-atac-GRCh38-1.2.0
+genome_build: hg38
+gtf: path/to/refdata-gex-GRCh38-2020-A/genes/genes.gtf
+

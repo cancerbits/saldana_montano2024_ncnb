@@ -1,0 +1,13 @@
+[gene-expression]
+reference,/grphome/resources/cellranger_data/refdata-gex-GRCh38-2020-A/
+cmo-set,/prjhome/ncnb2_noncode/metadata/default_cmo_ref.csv
+[libraries]
+fastq_id, fastqs, feature_types
+day28rep2_transcriptome_1,/grphome/data/ncnb/NCNB10X_L5811/day28rep2_transcriptome/,Gene Expression
+day28rep2_CMO_1,/grphome/data/ncnb/NCNB10X_L5811/day28rep2_CMO/,Multiplexing Capture
+[samples]
+sample_id,cmo_ids
+H7WT_day28_rep2,CMO309
+H7_17q_day28_rep2,CMO310
+H7_17q1qMYCN_day28_rep2,CMO311
+H7_17q1qMYCNdox_day28_rep2,CMO312

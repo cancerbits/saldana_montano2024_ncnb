@@ -1,0 +1,320 @@
+---
+title: 'Saldana, Montano, et al. -- ATAC-seq: Annotation and enrichment analysis' 
+author: 'Florian Halbritter'
+date: '`r format(Sys.time(), "%B %d, %Y %H:%M:%S %Z")`'
+output:
+  html_document: 
+    toc: yes
+    toc_float: yes
+    code_folding: show
+    highlight: pygments
+    df_print: paged
+---
+
+
+# Intro
+
+In this notebook, we interrogate overlaps between our chromatin modules (R1-R9) 
+and different sets of pre-defined annotations (from the `*_annotate_*Rmd` scripts).
+
+These results are shown in Figures 9b-d and Supplementary Fig. 12d-f of the paper.
+
+
+
+# Setup
+
+```{r, setup, include=FALSE}
+knitr::opts_knit$set(root.dir = '/home/rstudio')
+```
+
+Load utility scripts, constants, etc. used throughput the project:
+
+```{r, include=FALSE}
+source("R/setup.R")
+source("R/atacutils.R")
+
+library(GenomicRanges)
+library(patchwork)
+
+ENRICH_PADJ <- 0.005
+
+# p-values are very saturated for motifs because the number of matches is quite high,
+# we therefore apply stricter thresholds on these:
+ENRICH_PADJ_MOTIFS <- 0.0000001
+ENRICH_ODDS_MOTIFS <- log2(2)
+
+dir.create(resultsDir("enrichments"), showWarnings=FALSE)
+```
+
+Load in data from previous steps of the analysis.
+
+```{r load_caches}
+cmpSelections <- latestCache(CACHE_ATAC_COMPARISONS)
+regionSetsOfInterest <- latestCache(CACHE_ATAC_REGION_SETS)
+mtfLabels <- latestCache(CACHE_ATAC_MOTIF_LABELS)
+```
+
+
+
+# Load annotations
+
+Get all ready-prepared peak annotations from the `*_annotate_*.Rmd` scripts.
+
+```{r load_all_annots}
+# this find the names of all annotation caches (the file names start with the same prefix):
+enrichmentDatabaseCaches <- setdiff(unique(gsub("___v_.+.RData", "", grep(CACHE_ATAC_ENRICHDB_PREFIX, simpleCache::listCaches(), value=T))), c(CACHE_ATAC_ENRICHMENT_RESULTS,"atac_enrich_results"))
+
+# load the caches and concatenate them all in a long list with entries for each database:
+enrichmentDatabases <- list()
+for(cacheName in enrichmentDatabaseCaches) {
+  db <- latestCache(cacheName)
+  enrichmentDatabases <- c(enrichmentDatabases, db)
+}
+print(names(enrichmentDatabases))
+
+# remove empty lists:
+enrichmentDatabases <- enrichmentDatabases[sapply(enrichmentDatabases,function(x) length(x$lists))>0]
+```
+
+Show a summary of databases:
+
+```{r}
+tmp <- data.table(db=names(enrichmentDatabases), n_cat=sapply(enrichmentDatabases,function(x) length(x$lists) ), n_terms=sapply(enrichmentDatabases,function(x) sum(sapply(x$lists,length))))
+print(tmp)
+```
+
+
+# Over-representation analysis
+
+Use hypeR to perform hypergeometric tests to check the overlap of our regions of interest with the different annotation databases.
+
+The code below applies the same test procedure to for all the different types of "regions of interest" and all the different "databases" that we previously loaded. The background used for the enrichment tests is defined per database (to reflect the scope of genomic regions considered in each database).
+
+```{r run_enrich_analysis}
+enrichRes <- versionedCache(CACHE_ATAC_ENRICHMENT_RESULTS, instruction={        # cache test results
+  enrichRes <- rblapply(names(enrich_dbs), function(db_name) {                  # for each database
+
+		curDatabase <- enrich_dbs[[db_name]]
+		msgF("- enrichments for %s (%d/%d)", db_name, which(db_name==names(enrich_dbs)), length(enrich_dbs))
+		
+		res <- versionedCache("atac_enrich_results", instruction={
+			
+			# "universe" to use as background for enrichment analysis:
+			univ <- cur_db$univ
+			
+			# function to use to translate region IDs to the IDs in the current database:
+			# (this is only really relevant for gene-based annotation data, for which we use a gene-to-region assignment function as defined in `annotate_genes.Rmd`)
+			assgnFn <- cur_db$assign_fun
+			if(is.null(assgnFn)) assgnFn <- identity # use identity function, if no other function is given
+			
+			maxSize <- ceiling(3/4 * length(univ))
+			minSize <- 5
+						
+			enrichRes <- rblapply(names(cmp_sels), function(n) {				
+				cmp <- cmp_sels[[n]]
+				msg("\t --", n)
+				
+				# perform enrichment analysis using the hypergeometric test:
+				res <- rblapply(cmp, function(mod) {
+					msg("\t\t",  mod)
+					mod <- intersect(assgnFn(rois[[mod]]$rid), univ)
+					
+					# the canceRbits::cb_hyper functions wraps functions from the hypeR package for convenient use
+					as.data.table(canceRbits::cb_hyper(mod, background = univ, genesets = cur_db$lists, collapse=F, min_size=minSize, max_size=maxSize, verbose=F))
+				}, "grp", cores=min(length(cmp),ceiling(config$n_threads_max/2))) #
+				
+				# calculate additional metrics:
+				res[, perc:=overlap/signature]
+				res[, perc_bg:=geneset/background]
+				res[, log2odds:=log2(perc/perc_bg)]
+				res[, padj:=fdr]
+				res[, database:=db_name]
+
+				# replace infinite values with a small number:
+				replInf <- res[is.finite(log2odds),min(log2odds,na.rm=T)]*1.1
+				res[!is.finite(log2odds), log2odds:=replInf]
+				
+				# tweak labels for plots:
+				res[, short_label := label]	
+				if(grepl("motif",db_name)) res[, short_label:=gsub("^.+ \\((.+)\\)$","\\1",label)]
+				maxLabelLen <- 32
+				res[nchar(short_label)>maxLabelLen, short_label:=paste0(substr(short_label, 1, maxLabelLen-2),"..")]
+				
+			  return(res)
+			}, "cmp")
+			
+			return(enrichRes)
+		}, buildEnvir=list(
+		  cur_db=curDatabase,
+		  db_name=db_name,
+		  cmp_sels=cmp_sels,
+		  rois=rois
+		))
+		
+		return(res)
+	}, "db_name", cores=1) # 4
+
+	enrichRes[, is_gene_db:=grepl("\\.(genes|degs)_",database)]
+	enrichRes[is_gene_db==T, base_db:=gsub("^.+\\.(genes|degs)_(.+)$","\\2",database), by=database]
+	enrichRes[is_gene_db==T, gene_assignment:=gsub("^(.+).(genes|degs)_.+$","\\1",database), by=database]
+	enrichRes[, is_deg_db:=grepl("\\.degs_",database)]
+	enrichRes[is.na(base_db), base_db:=database]
+	enrichRes[, assign_n_db := paste_(gene_assignment, base_db)]
+  enrichRes[, mlogp:=-log10(pval)]
+  enrichRes[, perc100:=perc*100]
+  enrichRes[, mlog2odds:=-log2odds]
+	
+	return(enrichRes)
+}, buildEnvir=list(
+  enrich_dbs=enrichmentDatabases,
+  cmp_sels=cmpSelections,
+  rois=regionSetsOfInterest,
+  x="x"
+))
+```
+
+# Make plots
+
+Define "significant" results:
+
+```{r}
+enrichRes[, sig:=is.finite(log2odds) & is.finite(padj) & padj<=ENRICH_PADJ]
+enrichRes[base_db=="motifs", sig:=is.finite(log2odds) & is.finite(padj) & padj<=ENRICH_PADJ_MOTIFS & abs(log2odds)>=ENRICH_ODDS_MOTIFS ] # stricter thresholds for motifs, which have very low P-values 
+```
+
+Pick significant results and values for plotting:
+
+```{r}
+maxA <- 10
+alphaBy <- "mlogp"
+orderBy <- "mlog2odds"
+n <- "all_mods_id"
+geneAssign <- "promo_or_sigcor"
+
+e <- enrichRes[(is.na(gene_assignment) | gene_assignment==geneAssign) & cmp==n,]
+e[,.N,by=base_db]
+
+grpOrder <- (e[,unique(grp)])
+```
+
+Make plots for selected results of the enrichment analyses:
+
+```{r}
+ps <- list()
+
+# motifs:
+db <- "motifs"
+msg("\t",db)
+ee <- e[base_db==db & grp!="BG",]
+ee[, shorter_label:=gsub(" .+HUMAN.H11MO.+$","",mtfLabels[short_label])]
+eee <- ee[sig==T, head(.SD[order(get(orderBy)),,], 2),by=grp]
+ee <- ee[short_label%in%eee$short_label,]
+xOrder <- unique(rev(eee$shorter_label))
+if(ee[sig==T,.N]>0)	{
+	ps[[db]] <- ggplot(ee, aes(x=factor(grp, levels=grpOrder), y=factor(shorter_label,levels=xOrder))) + ylab("Transcription factor motif (HOCOMOCO)")
+}
+
+# region_types:
+ps <- c(ps, lapply(c("regions_dhs_type", "regions_catlas_type", "regions_enhatlas_type", "regions_chromhmm_type"), function(db) {
+	msg("\t",db)
+	ee <- e[base_db==db & grp!="BG",]
+	eee <- ee[sig==T, head(.SD[order(get(orderBy)),,], 2),by=grp]
+	ee <- ee[short_label%in%eee$short_label,]
+	xOrder <- unique(rev(eee$short_label))
+	if(ee[sig==T,.N]>0)	{
+		p <- ggplot(ee, aes(x=factor(grp, levels=grpOrder), y=factor(short_label,levels=xOrder)))  + ylab("Cluster marker genes (from scRNA-seq)") 
+		return(p)
+	} 
+	return(NULL)
+}))
+
+# super-enhancers:			
+ps <- c(ps, lapply(c("se_ga2020top_type", "se_bo2017_type", "se_vg2017_type"), function(db) {
+	msg("\t",db)
+	ee <- e[base_db==db & grp!="BG" & label!="BG",]
+	eee <- unique(ee[order(short_label), .(grp, short_label)])
+	xOrder <- unique(rev(eee$short_label))		
+	if(ee[sig==T,.N]>0)	{
+		p <- ggplot(ee, aes(x=factor(grp, levels=grpOrder), y=factor(short_label,levels=xOrder)))  + ylab("Super-enhancer type") 
+		return(p)
+	} 
+	return(NULL)
+}))
+
+# DEGs:
+usedClusts <- paste0("C",as.character(1:100)) # all
+ps <- c(ps, lapply(c("WT"), function(db) {
+	msg("\t",db)
+	ee <- e[base_db==db & grp!="BG",]
+	if(ee[sig==T,.N]>0)	{
+		p <- ggplot(ee, aes(x=factor(grp, levels=grpOrder), y=factor(short_label, levels=rev(usedClusts)))) + ylab("Cluster marker genes (from scRNA-seq)")
+		return(p)
+	} 
+	return(NULL)
+}))
+
+ps <- lapply(ps[!sapply(ps,is.null)], function(p) {
+	colRng <- c(-2,2)
+
+	p <- p + geom_point(aes(size=pmin(2^log2odds, 6), shape=sig, alpha=pmin(get(alphaBy), maxA)), fill="#333333")  
+	p <- p + scale_size_continuous(range=c(0.001,5), limits=c(0,6)) #, limits=c(0, 4))
+	p <- p + scale_alpha_continuous(limits=c(0,maxA), range=c(0,1)) + scale_shape_manual(values=c("TRUE"=21,"FALSE"=1)) + defTheme(topLegend=T, flipX=T) + xlab(NULL) 
+	p
+})
+```
+
+Plot the plots:
+
+```{r}
+for(p in ps) print(p)
+```
+Compile figure panels (Fig. 9b-d):
+
+```{r enrich_plot_1, fig.width=9.5, fig.height=14}
+p <- wrap_plots(ps[c(9,1,8:6)], guides="collect", ncol=1, heights = c(2,2,0.5,0.5,1))
+
+ggsave(filename = figuresDir("figure_atac_enrich_1.pdf"), plot = p, width = 8.5, height = 8, dpi = 600, unit = "in")
+fwrite(e[base_db%in%c("WT", "motifs", "se_ga2020top_type", "se_bo2017_type", "se_vg2017_type"),.(database, grp, short_label, label, perc=round(perc, 3), log2odds=round(log2odds, 3), pval=round(pval,3), padj=round(padj,3), sig)], file = figuresDir("figure_atac_enrich_1_data.csv"))
+
+print(p)
+```
+
+Compile figure panels (Supplementary Fig. 12d-f):
+
+```{r enrich_plot_2, fig.width=18, fig.height=4}
+p <- wrap_plots(ps[2:4], guides="collect", nrow=1)
+
+ggsave(filename = figuresDir("figure_atac_enrich_2.pdf"), plot = p, width = 16, height = 3, dpi = 600, unit = "in")
+fwrite(e[base_db%in%c("regions_dhs_type", "regions_catlas_type", "regions_enhatlas_type"),.(database, grp, short_label, label, perc=round(perc, 3), log2odds=round(log2odds, 3), pval=round(pval,3), padj=round(padj,3), sig)], file = figuresDir("figure_atac_enrich_2_data.csv"))
+
+print(p)
+```
+
+
+# Write tables
+
+```{r enrich_tables}
+fwrite(enrichRes, file=resultsDir("enrichments_all.csv.gz"))
+
+sigAny <- unique(enrichRes[sig==T & cmp=="all_mods_id" & base_db%in%c("WT", "motifs", "se_ga2020top_type", "se_bo2017_type", "se_vg2017_type", "regions_dhs_type", "regions_catlas_type", "regions_enhatlas_type"), .(label, database, cmp)])
+e <- merge(enrichRes, sigAny, by=c("cmp", "database", "label"))
+e <- e[(is.na(gene_assignment) | gene_assignment==geneAssign),]
+e <- e[,.(database, grp, label, short_label, n_module=signature, n_database=geneset, n_overlap=overlap, n_background=background, perc=round(perc, 3), log2odds=round(log2odds, 3), pval=round(pval,4), padj=round(padj,4), sig)]
+fwrite(e, file=resultsDir("../figures/supp_tbl_atac_enrichments_sig_any.csv"))
+fwrite(e[sig==TRUE,], file=resultsDir("../figures/supp_tbl_atac_enrichments_sig_only.csv"))
+print(head(e))
+```
+
+
+
+# Appendix
+
+**Runtime**
+
+`r time_diff(SETUP_TIME)`
+
+**Session Info**
+
+```{r}
+sessionInfo()
+```
